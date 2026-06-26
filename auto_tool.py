@@ -33,7 +33,7 @@ PROFILE_DIR = r"C:\SeleniumChromeProfile"
 CHECKIN_BUTTON_ID = "btnCheckIn"
 CHECKIN_XPATH = "//a[contains(text(), 'NHẬN QUÀ')] | //button[contains(text(), 'NHẬN QUÀ')]"
 
-PRELOAD_AT = (23, 59, 30)  # 30s buffer cho extract + telegrams trước midnight
+PRELOAD_AT = (23, 56, 0)  # 4 phút buffer — cover Chrome auto-update, AV scan, slow network
 MIDNIGHT_REFRESH_AT = (0, 0, 0)
 RESULT_WAIT_SECONDS = 60
 JS_POLL_INTERVAL_MS = 10
