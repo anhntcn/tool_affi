@@ -1,0 +1,12 @@
+{
+  "fire_offset_ms": -200,
+  "button_x": 1230,
+  "button_y": 348,
+  "button_region": [
+    1091,
+    325,
+    278,
+    46
+  ],
+  "chrome_window_size": "1920,1080"
+}

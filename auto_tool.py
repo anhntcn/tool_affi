@@ -43,14 +43,15 @@ API_PATH = "/api/v2/xeng/check-in-secure"
 TARGET_URL = f"https://{API_HOST}/rewards"
 CHECKIN_API_URL = f"https://{API_HOST}{API_PATH}"
 STATUS_API_URL = f"https://{API_HOST}/api/v2/xeng/check-in/status"
-XENG_SECRET_FALLBACK = "caffi_xeng_secure_2026_x82"
+SIGNATURE_TOKEN_URL = f"https://{API_HOST}/api/v2/security/signature-token"
+XENG_SECRET_FALLBACK = "caffi_xeng_secure_2026_x82"  # Deprecated: site đã đổi sang dynamic token
 
 # Parallel burst: spawn N thread cùng lúc, mỗi thread tự delay theo offset riêng.
 # Spacing 20ms × 10 thread = trải dài 180ms từ -200 tới -20ms client time.
 # Server nhận tương ứng quanh midnight ± 80ms (latency 99ms one-way).
 API_FIRE_OFFSET_MS = -350
-API_BURST_COUNT = 12
-API_BURST_SPACING_MS = 25
+API_BURST_COUNT = 6
+API_BURST_SPACING_MS = 100
 
 
 def _load_dotenv():
@@ -266,17 +267,68 @@ def sign_request(secret, timestamp_ms, nonce, user_id):
     return hmac.new(secret.encode(), base.encode(), hashlib.sha256).hexdigest()
 
 
-def build_headers(creds):
+def fetch_signing_token(creds):
+    """GET /api/v2/security/signature-token → dynamic HMAC key (TTL server-side).
+    Trả về (token, expires_at_ms). None nếu fail."""
+    headers = {
+        "Accept": "*/*",
+        "Cookie": creds["cookies"],
+        "User-Agent": creds["user_agent"],
+        "Referer": "https://app.caffiliate.vn/rewards",
+    }
+    req = urllib.request.Request(SIGNATURE_TOKEN_URL, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        print(f"fetch_signing_token fail: {e}")
+        return None, 0
+    if not data.get("success"):
+        return None, 0
+    inner = data.get("data", {}) or {}
+    token = inner.get("signatureToken")
+    if not token:
+        return None, 0
+    # Parse expiresAt ISO string, fallback ttlMs
+    expires_at_ms = 0
+    exp_iso = inner.get("expiresAt")
+    if exp_iso:
+        try:
+            dt = datetime.fromisoformat(exp_iso.replace("Z", "+00:00"))
+            expires_at_ms = int(dt.timestamp() * 1000)
+        except Exception:
+            pass
+    if not expires_at_ms:
+        expires_at_ms = int(time.time() * 1000) + (inner.get("ttlMs") or 60000)
+    return token, expires_at_ms
+
+
+def build_headers(creds, signing_key=None):
+    """Build request headers. signing_key = signature token (mới) hoặc xeng_secret (fallback cũ).
+    Match toàn bộ browser headers để tránh anti-bot detection."""
+    key = signing_key or creds.get("xeng_secret") or XENG_SECRET_FALLBACK
     timestamp = str(int(time.time() * 1000))
     nonce = generate_nonce()
-    signature = sign_request(creds["xeng_secret"], timestamp, nonce, creds["user_id"])
+    signature = sign_request(key, timestamp, nonce, creds["user_id"])
     return {
-        "Content-Type": "application/json",
+        # Base
         "Accept": "*/*",
+        "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Content-Type": "application/json",
         "Origin": "https://app.caffiliate.vn",
         "Referer": "https://app.caffiliate.vn/rewards",
         "User-Agent": creds["user_agent"],
         "Cookie": creds["cookies"],
+        # Client hints (real Chrome sends these)
+        "Sec-CH-UA": '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+        "Sec-CH-UA-Mobile": "?0",
+        "Sec-CH-UA-Platform": '"Windows"',
+        # Sec-Fetch (browser fingerprint)
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-GPC": "1",
+        # Custom auth headers
         "x-csrf-token": creds["csrf_token"],
         "x-signature": signature,
         "x-timestamp": timestamp,
@@ -316,8 +368,8 @@ def get_checkin_status(creds):
     return None
 
 
-def post_checkin(creds):
-    headers = build_headers(creds)
+def post_checkin(creds, signing_key=None):
+    headers = build_headers(creds, signing_key=signing_key)
     req = urllib.request.Request(CHECKIN_API_URL, data=b"{}", headers=headers, method="POST")
     sent_at = datetime.now()
     try:
@@ -325,7 +377,11 @@ def post_checkin(creds):
             payload = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body_text = e.read().decode(errors="replace")[:300]
-        return sent_at, {"success": False, "httpError": e.code, "body": body_text}
+        try:
+            payload = json.loads(body_text)
+        except Exception:
+            payload = {"success": False, "httpError": e.code, "body": body_text}
+        return sent_at, payload
     except Exception as e:
         return sent_at, {"success": False, "error": str(e)[:300]}
     return sent_at, payload
@@ -386,6 +442,83 @@ def api_mode():
         raise
 
 
+CREDS_JSON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "creds.json")
+
+
+def load_creds_from_file():
+    """Đọc creds từ creds.json (không cần Selenium). Update tay khi cookies expire."""
+    if not os.path.isfile(CREDS_JSON_PATH):
+        raise FileNotFoundError(f"Không thấy {CREDS_JSON_PATH}. Extract creds tay từ browser thường.")
+    with open(CREDS_JSON_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def remind_mode():
+    """Q3: check status hiện tại, chỉ nhắc nếu chưa điểm danh hôm nay.
+    Chạy nhiều lần/ngày qua Task Scheduler để tăng cơ hội user thấy."""
+    now = datetime.now()
+    try:
+        creds = load_creds_from_file()
+    except FileNotFoundError:
+        send_telegram("⚠️ Không có creds.json — không check được status. Chạy `python auto_tool.py dump-creds` để refresh (Selenium bị chặn, phải extract tay).")
+        return
+
+    status = get_checkin_status(creds)
+    if status is None:
+        send_telegram(
+            f"⚠️ Không query được status lúc {now.strftime('%H:%M')} — cookies có thể expired.\n"
+            f"Vào https://app.caffiliate.vn/rewards click NHẬN QUÀ để chắc chắn."
+        )
+        return
+
+    streak = status.get("currentStreak")
+
+    if status.get("todayCheckedIn"):
+        pos = status.get("todayCheckInPosition")
+        pos_str = f" (top {pos})" if pos else ""
+        # Gửi telegram heartbeat để user biết task đang chạy đúng
+        send_telegram(f"✅ [{now.strftime('%H:%M')}] Đã điểm danh hôm nay. Streak={streak}{pos_str}")
+    else:
+        # Chưa điểm — nhắc user
+        hour = now.hour
+        if hour < 20:
+            tone = "🔔"
+            urgency = "Vào click NHẬN QUÀ để giữ streak."
+        elif hour < 23:
+            tone = "⚠️"
+            urgency = "Còn vài tiếng để click!"
+        else:
+            tone = "🚨"
+            urgency = "SẮP HẾT GIỜ! Streak sắp mất!"
+
+        send_telegram(
+            f"{tone} CHƯA ĐIỂM DANH ({now.strftime('%H:%M')})\n"
+            f"Streak hiện tại: {streak}. {urgency}\n"
+            f"👉 https://app.caffiliate.vn/rewards"
+        )
+
+
+def api_static_mode():
+    """Version bỏ Selenium: đọc creds từ creds.json, chạy full flow burst."""
+    try:
+        _api_static_inner()
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()[-800:]
+        send_telegram(f"💥 api_static_mode CRASH: {type(e).__name__}: {str(e)[:200]}\n{tb}")
+        raise
+
+
+def _api_static_inner():
+    print(f"API STATIC mode: no Selenium. burst x{API_BURST_COUNT} mỗi {API_BURST_SPACING_MS}ms")
+    wait_until(PRELOAD_AT)
+
+    creds = load_creds_from_file()
+    send_telegram(f"Bắt đầu phiên API điểm danh ngày {datetime.now().strftime('%Y-%m-%d')} (static, no-Selenium)")
+    send_telegram(f"🔑 Creds từ creds.json OK (csrf {creds['csrf_token'][:8]}..., user {creds['user_id']})")
+    _run_burst_flow(creds)
+
+
 def _api_mode_inner():
     print(f"API mode: preload {PRELOAD_AT}, fire midnight{API_FIRE_OFFSET_MS:+d}ms, burst x{API_BURST_COUNT} mỗi {API_BURST_SPACING_MS}ms")
     wait_until(PRELOAD_AT)
@@ -411,6 +544,10 @@ def _api_mode_inner():
 
     if not creds:
         return
+    _run_burst_flow(creds)
+
+
+def _run_burst_flow(creds):
 
     # Safety: nếu đã quá midnight (hoặc gần midnight tới mức không đủ thời gian),
     # abort thay vì chờ midnight ngày kế tiếp (24h)
@@ -440,16 +577,23 @@ def _api_mode_inner():
 
     if samples:
         max_rtt = max(samples)
-        # Data 4 đêm: server arrival ≤ -460ms = top 3, -240ms = top 4.
-        # Mục tiêu: GUARANTEE server arrival ≤ -460ms ngay cả khi latency spike 5x.
-        # Latency thực lúc fire có thể gấp 5.2x latency đo trước midnight 5s.
-        # fire_offset = target_arrival - estimated_one_way = -460 - max_rtt × 2.5
-        dynamic_offset_ms = -460 - int(max_rtt * 2.5)
-        dynamic_offset_ms = max(-1500, min(-50, dynamic_offset_ms))
+        # Mục tiêu: GUARANTEE checkin (giữ streak), không cố leo top.
+        # Fire mild ~-150ms, burst 6 spacing 100ms = trải 500ms từ -150 đến +350.
+        # Server arrival rơi vào [0, +X] với mọi mức latency thực tế.
+        dynamic_offset_ms = -150 - int(max_rtt / 2)
+        dynamic_offset_ms = max(-600, min(-50, dynamic_offset_ms))
         send_telegram(f"📡 RTT samples {[int(s) for s in samples]}ms, max={int(max_rtt)}ms → fire offset {dynamic_offset_ms}ms")
     else:
         dynamic_offset_ms = API_FIRE_OFFSET_MS
         send_telegram(f"⚠️ RTT đo fail, dùng offset mặc định {dynamic_offset_ms}ms")
+
+    # Fetch signing token (server TTL, gọi gần fire để không expire)
+    signing_token, token_exp_ms = fetch_signing_token(creds)
+    if not signing_token:
+        send_telegram("❌ Không lấy được signing token, huỷ burst")
+        return
+    ttl_remaining = (token_exp_ms - int(time.time() * 1000)) / 1000.0
+    send_telegram(f"🔐 Signing token OK, TTL còn ~{ttl_remaining:.0f}s")
 
     print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Wait until midnight{dynamic_offset_ms:+d}ms...", flush=True)
     wait_until_next_midnight(offset_ms=dynamic_offset_ms)
@@ -465,7 +609,7 @@ def _api_mode_inner():
 
     def fire_at(idx):
         time.sleep(idx * API_BURST_SPACING_MS / 1000.0)
-        sent_at, payload = post_checkin(creds)
+        sent_at, payload = post_checkin(creds, signing_key=signing_token)
         recv_at = datetime.now()
         latency_ms = (recv_at - sent_at).total_seconds() * 1000
         results[idx] = (idx, sent_at, payload, latency_ms, recv_at)
@@ -509,7 +653,9 @@ def _api_mode_inner():
         completed = [r for r in results if r]
         if completed:
             p = completed[0][2]
-            first_err = p.get("message") or p.get("error") or "fail"
+            first_err = (p.get("message") or p.get("error")
+                         or (f"HTTP{p.get('httpError')}: {p.get('body','')[:100]}" if p.get("httpError") else None)
+                         or f"raw: {str(p)[:150]}")
         else:
             first_err = "no thread completed (timeout?)"
         msg = f"❌ Burst x{API_BURST_COUNT} fail ({len(completed)}/{API_BURST_COUNT} done): {first_err}"
@@ -667,6 +813,23 @@ if __name__ == "__main__":
         now_mode()
     elif mode == "api":
         api_mode()
+    elif mode == "api-static":
+        api_static_mode()
+    elif mode == "remind":
+        remind_mode()
+    elif mode == "dump-creds":
+        # Extract creds từ Chrome rồi lưu ra file JSON để upload lên server
+        d = setup_driver()
+        try:
+            d.get(TARGET_URL)
+            WebDriverWait(d, 15).until(EC.presence_of_element_located((By.ID, CHECKIN_BUTTON_ID)))
+            creds = extract_api_credentials(d)
+        finally:
+            d.quit()
+        out_path = sys.argv[2] if len(sys.argv) > 2 else "creds.json"
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(creds, f, ensure_ascii=False, indent=2)
+        print(f"Đã lưu creds vào {out_path}. Upload file này lên server.")
     elif mode == "api-now":
         # Test API mode ngay không chờ midnight: lấy creds rồi gửi POST luôn
         d = setup_driver()
@@ -676,9 +839,16 @@ if __name__ == "__main__":
             creds = extract_api_credentials(d)
         finally:
             d.quit()
-        print(f"Creds OK: csrf={creds['csrf_token'][:8]}..., user={creds['user_id']}, secret={creds['xeng_secret']}")
+        print(f"Creds OK: csrf={creds['csrf_token'][:8]}..., user={creds['user_id']}")
+        # Fetch dynamic signing token
+        signing_token, exp_ms = fetch_signing_token(creds)
+        if not signing_token:
+            print("❌ Không lấy được signing token")
+            sys.exit(1)
+        ttl = (exp_ms - int(time.time() * 1000)) / 1000
+        print(f"Signing token OK, TTL còn {ttl:.0f}s")
         print("Fire POST...")
-        _, payload = post_checkin(creds)
+        _, payload = post_checkin(creds, signing_key=signing_token)
         print("Response:", payload)
     else:
         checkin_mode()
