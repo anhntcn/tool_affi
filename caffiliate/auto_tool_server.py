@@ -51,7 +51,8 @@ def send_telegram(msg):
         print(f"[no-tg] {msg}")
         return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    data = urllib.parse.urlencode({"chat_id": TG_CHAT, "text": f"[Caffiliate-Oracle] {msg}"[:3900]}).encode()
+    text = f"☕ CAFFI-Oracle · {datetime.now().strftime('%H:%M:%S')}\n{msg}"[:3900]
+    data = urllib.parse.urlencode({"chat_id": TG_CHAT, "text": text}).encode()
     try:
         with urllib.request.urlopen(url, data=data, timeout=10) as r:
             r.read()

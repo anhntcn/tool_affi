@@ -81,7 +81,8 @@ def send_telegram(message):
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     # Telegram limit 4096 char, cắt để tránh fail khi exception trace quá dài
-    text = f"[Caffiliate] {message}"[:3900]
+    # Header thống nhất: emoji + site + giờ → dễ phân biệt Caffi/Saffi trong cùng channel
+    text = f"☕ CAFFI · {datetime.now().strftime('%H:%M:%S')}\n{message}"[:3900]
     data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode()
     try:
         with urllib.request.urlopen(url, data=data, timeout=10) as resp:

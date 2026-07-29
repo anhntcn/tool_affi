@@ -1,0 +1,6 @@
+{
+  "bearer_token": "379|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "cookies": "XSRF-TOKEN=...; saffi_api_session=...",
+  "xsrf_token": "eyJpdi...  (giá trị header x-xsrf-token, đã URL-decode)",
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ... Chrome/150.0.0.0 Safari/537.36"
+}

@@ -445,13 +445,16 @@ def cmd_run():
     #    - Wait until 00:00:00 + offset_ms (bên trong browser)
     #    - Fire POST /check-in-secure trực tiếp
     #    → Fire chính xác 00:00:00.050 (client), server nhận ~+30-100ms → top 1-3
-    fire_offset_ms = 0  # fire chính xác 00:00:00.000 → aggressive top 1-5
-    send_telegram(f"🚀 Inject fire JS. Sẽ fire tại midnight+{fire_offset_ms}ms.")
+    # Test aggressive: fire pre-midnight. Turnstile token có TTL 5min nên OK.
+    # Nếu server reject "đã điểm hôm qua" → biết được server không queue → revert offset.
+    # Cứu streak: bạn click tay sáng hôm sau nếu fail.
+    fire_offset_ms = -500  # sweet spot: top 5-8 ceiling từ home + Turnstile
+    send_telegram(f"🚀 Inject fire JS. Sẽ fire tại midnight{fire_offset_ms:+d}ms.")
     ok, msg = fire_direct_post_via_cdp(fire_offset_ms=fire_offset_ms)
     if ok:
         send_telegram(f"🖱️ {msg[:500]}")
     else:
-        send_telegram(f"⚠️ Fire fail: {msg[:400]}")
+        send_telegram(f"⚠️ Fire fail: {msg[:400]}\nStreak có thể mất, click tay ngay để cứu!")
 
     # 6. Chờ 3s cho Chrome xử lý, verify status
     time.sleep(3)
@@ -462,7 +465,7 @@ def cmd_run():
         if status and status.get("todayCheckedIn"):
             pos_rank = status.get("todayCheckInPosition")
             streak = status.get("currentStreak")
-            send_telegram(f"✅ Click OK lúc {fire_ts} | streak={streak}" + (f" | 🏆 top {pos_rank}" if pos_rank else ""))
+            send_telegram(f"✅ Click OK lúc {now_ts} | streak={streak}" + (f" | 🏆 top {pos_rank}" if pos_rank else ""))
         elif status:
             send_telegram(f"⚠️ Click lúc {now_ts} nhưng status chưa update. Sẽ check lại 30s...")
             time.sleep(30)
