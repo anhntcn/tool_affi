@@ -242,9 +242,10 @@ def browser_checkin(creds, note="", deadline_s=POLL_MAX_SECONDS):
         return False
     send_telegram("🌐 Gặp captcha Turnstile — chuyển sang điểm danh bằng Chrome thật (CDP)…")
     try:
-        # Chrome THẬT + CDP để vượt Turnstile (Playwright tự mở bị Cloudflare chặn). deadline CDP
-        # ngắn hơn vì Chrome tự khởi động; giới hạn để không giữ Chrome quá lâu.
-        payload = saffi_browser.checkin_cdp(creds, deadline_s=min(deadline_s, 240))
+        # Chrome THẬT + CDP để vượt Turnstile (Playwright tự mở bị Cloudflare chặn). Giữ deadline
+        # dài (tới POLL_MAX_SECONDS ~15') để bao được cả đêm saffi mở cửa trễ (00:03–00:08+): nút
+        # "Điểm danh ngay" hiện sẵn nhưng server chưa mở → _wait_and_click bấm lại tới khi được.
+        payload = saffi_browser.checkin_cdp(creds, deadline_s=min(deadline_s, 900))
     except saffi_browser.NeedsInteractiveLogin:
         send_telegram("🔐 Chrome chưa đăng nhập saffi — chạy 1 lần: python saffi_checkin.py cdp-login")
         return False
