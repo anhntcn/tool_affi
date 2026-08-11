@@ -1,5 +1,9 @@
 .env
 creds.json
+creds_other*.json
 __pycache__/
 *.pyc
 log.txt
+.pw-profile/
+.chrome-profile/
+saffi_diag.png

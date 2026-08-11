@@ -1,0 +1,6 @@
+{
+  "access_token": "eyJhbGci...  (JWT sau 'Bearer ' trong header authorization — hết hạn sau ~15')",
+  "refresh_token": "931f034c-...  (giá trị cookie shop_refresh_token)",
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ... Chrome/150.0.0.0 Safari/537.36",
+  "refresh_url": "để trống — mặc định dùng https://api.hoantienshopee.me/auth/refresh (đã xác nhận)"
+}

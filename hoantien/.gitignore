@@ -1,0 +1,6 @@
+# Bí mật & phiên đăng nhập — KHÔNG BAO GIỜ commit
+creds.json
+.env
+.pw-profile/
+__pycache__/
+*.pyc

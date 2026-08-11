@@ -42,14 +42,19 @@ STATUS_API_URL = f"https://{API_HOST}/api/spoint/status"
 LEADERBOARD_API_URL = f"https://{API_HOST}/api/spoint/leaderboard"
 SITE_ROOT = f"https://{API_HOST}/qua-tang"  # dùng để đo RTT
 
-# Burst trải qua mốc reset: bắt đầu bắn TRƯỚC 00:00 một chút rồi kéo dài QUA mốc.
-# Lý do: server chỉ mở điểm danh ngày mới đúng lúc rollover. Request tới trước mốc trả
-# "đã điểm danh (hôm qua)" — vô hại; request tới sau mốc mới success. Phải phủ cả 2 phía
-# mốc thì mới vừa giành được early-bird vừa không bao giờ trượt.
-BURST_LEAD_MS = 500       # bắt đầu bắn trước 00:00 bao nhiêu ms
-BURST_WINDOW_MS = 3000    # tổng thời gian bắn (kéo dài qua mốc reset)
-BURST_INTERVAL_MS = 60    # khoảng cách giữa các request → ~50 request phủ đều cửa sổ
-CONFIRM_AFTER_MS = 3200   # sau mốc reset bao lâu thì xác nhận qua status (đảm bảo server đã rollover)
+# QUAN TRỌNG — saffi mở điểm danh ngày mới TRỄ vài phút sau 00:00 (quan sát: early-bird #1
+# check-in lúc ~00:03–00:08 ICT), và server THROTTLE nếu bị bắn dồn dập. Nên chiến lược là:
+# burst NHỎ lúc 00:00 (phòng khi mở đúng mốc), rồi POLL NHẸ 1 request mỗi vài giây, kiên trì
+# tới ~15 phút cho tới khi cửa mở. Vừa tránh throttle vừa bắt được rollover trễ (poll ngay khi
+# cửa mở còn có thể giành early-bird #1).
+BURST_LEAD_MS = 300       # bắt đầu bắn trước 00:00 bao nhiêu ms
+BURST_WINDOW_MS = 2000    # burst đợt đầu trải cửa sổ quanh mốc
+BURST_INTERVAL_MS = 300   # → ~7 request nhẹ nhàng (KHÔNG hammer để tránh bị throttle)
+
+POLL_GAP_MS = 4000        # sau burst đầu: poll 1 request mỗi 4s (nhẹ, không throttle)
+POLL_MAX_SECONDS = 900    # kiên trì tới 15 phút (rollover saffi có thể trễ vài phút)
+
+ICT_OFFSET_HOURS = 7          # server reset theo 00:00 giờ VN (ICT = UTC+7)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CREDS_PATH = os.path.join(HERE, "creds.json")
@@ -215,6 +220,69 @@ def already_checked(payload):
     return payload.get("httpError") in (409, 422) or "đã điểm danh" in msg or "already" in msg
 
 
+def captcha_required(payload):
+    """Từ 2026-08-10 saffi thêm cổng chống bot: POST /checkin trả 400 'hoàn thành xác thực
+    chống bot (Captcha)' khi phiên chưa giải captcha (Cloudflare Turnstile). Bắn API trần
+    không có token thì luôn dính 400 → phát hiện sớm để chuyển sang điểm danh bằng trình duyệt."""
+    msg = (payload.get("message") or "").lower()
+    return payload.get("httpError") == 400 and ("captcha" in msg or "chống bot" in msg)
+
+
+def browser_checkin(creds, note="", deadline_s=POLL_MAX_SECONDS):
+    """Vượt Turnstile bằng trình duyệt thật: mở qua-tang (đã đăng nhập) và bấm nút Điểm danh,
+    để site tự sinh token. Trả True nếu điểm danh được. Xem saffi_browser.py."""
+    sys.path.insert(0, HERE)
+    try:
+        import saffi_browser
+    except Exception as e:
+        send_telegram(
+            f"❌ Thiếu Playwright để vượt captcha ({str(e)[:100]}).\n"
+            "  pip install playwright && python -m playwright install chromium"
+        )
+        return False
+    send_telegram("🌐 Gặp captcha Turnstile — chuyển sang điểm danh bằng Chrome thật (CDP)…")
+    try:
+        # Chrome THẬT + CDP để vượt Turnstile (Playwright tự mở bị Cloudflare chặn). deadline CDP
+        # ngắn hơn vì Chrome tự khởi động; giới hạn để không giữ Chrome quá lâu.
+        payload = saffi_browser.checkin_cdp(creds, deadline_s=min(deadline_s, 240))
+    except saffi_browser.NeedsInteractiveLogin:
+        send_telegram("🔐 Chrome chưa đăng nhập saffi — chạy 1 lần: python saffi_checkin.py cdp-login")
+        return False
+    except Exception as e:
+        send_telegram(f"❌ Điểm danh qua trình duyệt lỗi: {str(e)[:160]}")
+        return False
+    if payload and (payload.get("success") or payload.get("status") == "success"):
+        send_telegram(build_success_block(creds, payload, f"qua trình duyệt {note}".strip()))
+        return True
+    if payload and already_checked(payload):
+        send_telegram("ℹ️ (trình duyệt) Hôm nay đã điểm danh rồi.")
+        return True
+    send_telegram(f"❌ Điểm danh qua trình duyệt CHƯA được. resp: {str(payload)[:160]}")
+    return False
+
+
+def checkin_ict_date(checkin_date_str):
+    """checkin_date của server ở dạng UTC (vd '2026-07-29T17:00:00.000000Z' = 00:00 ICT ngày 30).
+    Trả về ngày theo lịch ICT, hoặc None nếu không parse được."""
+    if not checkin_date_str:
+        return None
+    try:
+        s = checkin_date_str.replace("Z", "")[:19]
+        dt = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S") + timedelta(hours=ICT_OFFSET_HOURS)
+        return dt.date()
+    except Exception:
+        return None
+
+
+def success_for_date(payload, target_date):
+    """True nếu payload là checkin THÀNH CÔNG đúng cho target_date (không phải vớt ngày cũ)."""
+    if not payload.get("success"):
+        return False
+    c = (payload.get("data") or {}).get("checkin") or {}
+    d = checkin_ict_date(c.get("checkin_date"))
+    return d is None or d == target_date  # nếu không có date thì tạm coi là hợp lệ
+
+
 def do_single(creds, label="checkin"):
     sent, payload = post_checkin(creds)
     latency = (datetime.now() - sent).total_seconds() * 1000
@@ -259,44 +327,91 @@ def status_as_payload(st):
     }}
 
 
+def target_today(now=None):
+    """Ngày ICT ta muốn điểm danh: nếu đang ở 23h (sắp qua mốc) thì là ngày mai, ngược lại hôm nay."""
+    now = now or datetime.now()
+    return (now + timedelta(minutes=30)).date() if now.hour == 23 else now.date()
+
+
+def _report_today_success(creds, result, count, target_date):
+    idx, sent, payload, recv = result
+    latency = (recv - sent).total_seconds() * 1000
+    meta = f"burst #{idx + 1}/{count} · fire {sent.strftime('%H:%M:%S.%f')[:-3]} · {latency:.0f}ms"
+    send_telegram(build_success_block(creds, payload, meta))
+
+
 def do_burst(creds, count=None, interval_ms=BURST_INTERVAL_MS):
-    """Bắn burst rồi báo cáo. Nếu burst không có phát nào success (ví dụ toàn bộ rơi
-    trước mốc reset → 'đã điểm danh hôm qua'), xác nhận qua /status và tự bắn cứu."""
+    """Burst nhẹ lúc 00:00, rồi poll nhẹ tới khi giành ĐÚNG checkin HÔM NAY (saffi mở cửa trễ
+    vài phút và throttle nếu bắn dồn). Vớt streak ngày cũ xong vẫn poll tiếp cho hôm nay."""
     if count is None:
         count = max(1, BURST_WINDOW_MS // interval_ms)
-    done = fire_burst(creds, count, interval_ms)
-    successes = [r for r in done if r[2].get("success")]
+    target = target_today()
+    recovered_prev = False   # đã có phát vớt điểm danh cho ngày cũ chưa
 
-    if successes:
-        successes.sort(key=lambda r: r[1])  # phát bắn sớm nhất mà thành công → early-bird tốt nhất
-        idx, sent, payload, recv = successes[0]
-        latency = (recv - sent).total_seconds() * 1000
-        meta = f"burst #{idx + 1}/{count} · fire {sent.strftime('%H:%M:%S.%f')[:-3]} · {latency:.0f}ms"
-        send_telegram(build_success_block(creds, payload, meta))
+    def scan(results):
+        """Trả về result thành công cho HÔM NAY (bắn sớm nhất), hoặc None. Đồng thời phát hiện vớt ngày cũ."""
+        nonlocal recovered_prev
+        today_hits = []
+        for r in results:
+            p = r[2]
+            if p.get("success"):
+                if success_for_date(p, target):
+                    today_hits.append(r)
+                else:
+                    recovered_prev = True  # success nhưng của ngày cũ = vừa vớt streak
+        today_hits.sort(key=lambda r: r[1])
+        return today_hits[0] if today_hits else None
+
+    # Đợt 1: burst NHỎ quanh mốc (phòng khi server mở đúng 00:00 như hoantien).
+    first = fire_burst(creds, count, interval_ms)
+    hit = scan(first)
+    if hit:
+        if recovered_prev:
+            send_telegram("🛟 Đã vớt điểm danh ngày hôm qua trước mốc — tiếp tục lấy hôm nay:")
+        _report_today_success(creds, hit, count, target)
         return
 
-    # Không phát nào success → dùng /status làm nguồn sự thật (server đã rollover ngày mới chưa?)
+    # Cổng captcha chống bot → API trần vô dụng, chuyển sang điểm danh bằng trình duyệt (Turnstile).
+    if any(captcha_required(r[2]) for r in first):
+        browser_checkin(creds, "burst đầu")
+        return
+
+    # Chưa mở → POLL NHẸ 1 request mỗi POLL_GAP_MS cho tới khi cửa mở (saffi thường trễ vài phút).
+    deadline = time.time() + POLL_MAX_SECONDS
+    send_telegram(
+        ("🛟 Đã vớt hôm qua. " if recovered_prev else "")
+        + f"Cửa chưa mở — poll nhẹ mỗi {POLL_GAP_MS // 1000}s tới khi điểm danh được (≤{POLL_MAX_SECONDS // 60}')…"
+    )
+    polls = 0
+    throttled = 0
+    while time.time() < deadline:
+        polls += 1
+        sent, p = post_checkin(creds)
+        recv = datetime.now()
+        if p.get("success") and success_for_date(p, target):
+            _report_today_success(creds, (0, sent, p, recv), 1, target)
+            return
+        if p.get("success"):
+            recovered_prev = True  # success nhưng của ngày cũ
+        if captcha_required(p):
+            remain = max(60, int(deadline - time.time()))
+            browser_checkin(creds, f"sau {polls} lần poll", deadline_s=remain)
+            return
+        if p.get("httpError") == 429 or "quá nhiều" in (p.get("message") or "").lower():
+            throttled += 1
+            time.sleep(5)  # bị throttle → lùi thêm
+        time.sleep(POLL_GAP_MS / 1000.0)
+
+    # Hết 15' vẫn chưa được → xác nhận cuối bằng /status.
     st = get_status(creds)
     if st and st.get("checked_in_today"):
-        # Đã điểm danh ngày mới (có thể 1 phát thành công nhưng bị coi là trùng do đua)
-        send_telegram(build_success_block(creds, status_as_payload(st), "xác nhận qua /status"))
-        return
-
-    # Server báo CHƯA điểm danh hôm nay → burst vừa rồi rơi hết trước mốc. Bắn cứu ngay (giờ đã qua mốc).
-    n_already = sum(1 for r in done if already_checked(r[2]))
-    send_telegram(f"🛟 Burst trượt mốc ({n_already}/{len(done)} rơi vào hôm qua) — bắn cứu sau nửa đêm…")
-    for attempt in range(1, 6):
-        sent, payload = post_checkin(creds)
-        if payload.get("success"):
-            latency = (datetime.now() - sent).total_seconds() * 1000
-            send_telegram(build_success_block(creds, payload, f"recovery #{attempt} · {latency:.0f}ms"))
+        tc = st.get("today_checkin") or {}
+        if checkin_ict_date(tc.get("checkin_date")) == target:
+            send_telegram(build_success_block(creds, status_as_payload(st), f"xác nhận qua /status sau {polls} lần poll"))
             return
-        if already_checked(payload):
-            send_telegram("ℹ️ Đã điểm danh hôm nay (xác nhận sau mốc reset).")
-            return
-        time.sleep(0.3)
-    err = payload.get("message") or payload.get("error") or payload.get("body") or "fail"
-    send_telegram(f"❌ Điểm danh FAIL sau burst + 5 lần cứu\n{err}")
+    thr = f", throttle {throttled}x" if throttled else ""
+    prev_note = " (đã vớt được ngày hôm qua)" if recovered_prev else ""
+    send_telegram(f"❌ Không điểm danh được HÔM NAY sau {POLL_MAX_SECONDS // 60}' / {polls} lần poll{thr}{prev_note}")
 
 
 def run_scheduled(creds):
@@ -312,8 +427,8 @@ def run_scheduled(creds):
     rtt_str = f"{[int(s) for s in samples]}ms" if samples else "n/a"
     count = max(1, BURST_WINDOW_MS // BURST_INTERVAL_MS)
     send_telegram(
-        f"📡 RTT {rtt_str} · bắn {count} phát trải cửa sổ "
-        f"[-{BURST_LEAD_MS}ms → +{BURST_WINDOW_MS - BURST_LEAD_MS}ms] quanh 00:00"
+        f"📡 RTT {rtt_str} · burst nhẹ {count} phát lúc 00:00, rồi poll mỗi {POLL_GAP_MS // 1000}s "
+        f"tới khi cửa mở (≤{POLL_MAX_SECONDS // 60}')"
     )
 
     # Bắt đầu bắn TRƯỚC mốc BURST_LEAD_MS, cửa sổ kéo dài QUA mốc → luôn có phát rơi vào ngày mới.
@@ -355,8 +470,23 @@ def main():
         run_scheduled(creds)
     elif cmd == "status":
         do_status(creds)
+    elif cmd == "browser":
+        browser_checkin(creds, "chạy tay", deadline_s=180)
+    elif cmd == "cdp":
+        sys.path.insert(0, HERE)
+        import saffi_browser
+        res = saffi_browser.checkin_cdp(creds, deadline_s=180)
+        print(res)
+    elif cmd == "cdp-login":
+        sys.path.insert(0, HERE)
+        import saffi_browser
+        saffi_browser.cdp_login()
+    elif cmd == "browser-login":
+        sys.path.insert(0, HERE)
+        import saffi_browser
+        saffi_browser.interactive_login(creds)
     else:
-        sys.exit("Lệnh không hợp lệ. Dùng: test | now | run | status")
+        sys.exit("Lệnh không hợp lệ. Dùng: test | now | run | status | browser | cdp | cdp-login | browser-login")
 
 
 if __name__ == "__main__":
