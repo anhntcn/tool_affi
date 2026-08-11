@@ -231,7 +231,7 @@ def _wait_and_click(page, captured, deadline_s, log):
             if _checkin_state(page) == "done":
                 log("ℹ️ Đã điểm danh hôm nay.")
                 return captured["success"] or {"success": True, "note": "already"}
-            page.wait_for_timeout(800)
+            page.wait_for_timeout(300)  # poll sát để bấm gần như tức thì khi nút mở / cửa mở
             if time.time() - last_reload > 45:  # chỉ reload khi kẹt quá lâu (token lỗi/không tới)
                 log("… kẹt lâu, reload để re-render Turnstile…")
                 try:
@@ -289,10 +289,15 @@ def _wait_cdp(port=CDP_PORT, timeout=25):
     return False
 
 
-def checkin_cdp(creds=None, port=CDP_PORT, deadline_s=180, verbose=True, auto_launch=True, keep_open=False):
+def checkin_cdp(creds=None, port=CDP_PORT, deadline_s=180, verbose=True, auto_launch=True,
+                keep_open=False, settle_s=8):
     """Điểm danh qua Chrome THẬT: tự chạy Chrome (hồ sơ .chrome-profile đã đăng nhập) với remote
     debugging, Playwright connect_over_cdp rồi chờ nút 'Điểm danh ngay' và bấm — vượt Turnstile.
-    LẦN ĐẦU phải đăng nhập: python saffi_checkin.py cdp-login."""
+    LẦN ĐẦU phải đăng nhập: python saffi_checkin.py cdp-login.
+
+    settle_s: số giây chờ Turnstile TỰ giải khi browser còn 'sạch' (chưa attach CDP) trước khi kết
+    nối. Gắn CDP trong lúc challenge đang chạy dễ bị Cloudflare chặn → đừng để quá nhỏ. Mặc định 8s
+    (nút thường mở ~5-7s); có thể thử giảm còn ~5s nếu muốn nhanh hơn, nhưng phải test kỹ."""
     from playwright.sync_api import sync_playwright
 
     creds = creds or _load_creds()
@@ -310,8 +315,8 @@ def checkin_cdp(creds=None, port=CDP_PORT, deadline_s=180, verbose=True, auto_la
             log("❌ Không mở được cổng debug — có thể Chrome đang chạy sẵn bằng hồ sơ khác. "
                 "Đóng hết Chrome rồi thử lại.")
         # Chờ Turnstile TỰ giải khi browser còn "sạch" (chưa attach CDP) → tăng tỉ lệ qua challenge.
-        log("→ chờ Turnstile tự giải (~8s) trước khi kết nối…")
-        time.sleep(8)
+        log(f"→ chờ Turnstile tự giải (~{settle_s}s) trước khi kết nối…")
+        time.sleep(settle_s)
     try:
         with sync_playwright() as p:
             browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
@@ -531,16 +536,18 @@ def diag(creds=None, fresh=False):
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "checkin"
-    # Tùy chọn: truyền đường dẫn creds khác để test tài khoản phụ, vd:
-    #   python saffi_browser.py diag creds_other.json
-    alt = sys.argv[2] if len(sys.argv) > 2 else None
+    arg2 = sys.argv[2] if len(sys.argv) > 2 else None
+    # arg2 là file creds phụ cho checkin/diag/login; nhưng là settle_s (số) cho cdp.
+    alt = arg2 if cmd in ("checkin", "diag", "login") else None
     creds = json.load(open(alt, encoding="utf-8")) if alt else None
     fresh = alt is not None  # creds phụ → context sạch, không dùng .pw-profile của acc chính
     if cmd == "checkin":
         res = checkin(creds, headless=False, fresh=fresh)
         print(json.dumps(res, ensure_ascii=False)[:600] if res else "None")
     elif cmd == "cdp":
-        res = checkin_cdp(creds)
+        # Tùy chọn: settle_s (giây chờ Turnstile giải trước khi attach), vd: python saffi_browser.py cdp 5
+        settle = float(arg2) if arg2 else 8
+        res = checkin_cdp(creds, settle_s=settle)
         print(json.dumps(res, ensure_ascii=False)[:600] if res else "None")
     elif cmd == "cdp-login":
         cdp_login()
