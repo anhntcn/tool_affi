@@ -289,6 +289,24 @@ def _wait_cdp(port=CDP_PORT, timeout=25):
     return False
 
 
+def _seed_cdp_session(ctx, page, creds):
+    """Nạp phiên từ creds.json vào Chrome (CDP): cookie Sanctum + localStorage['token']. Dùng để
+    TỰ-LÀNH khi phiên hồ sơ .chrome-profile hết hạn — khỏi phải cdp-login tay. Chỉ có tác dụng nếu
+    bearer_token/cookies trong creds.json còn sống (token Sanctum saffi thường sống lâu)."""
+    try:
+        _seed_cookies(ctx, creds)  # add_cookies XSRF-TOKEN + saffi_api_session cho app.saffi.vn
+    except Exception:
+        pass
+    tok = creds.get("bearer_token") or ""
+    if tok:
+        try:
+            if SITE_HOST not in page.url:
+                page.goto(f"https://{SITE_HOST}/", wait_until="domcontentloaded", timeout=30000)
+            page.evaluate("(t) => { try { localStorage.setItem('token', t); } catch(e){} }", tok)
+        except Exception:
+            pass
+
+
 def checkin_cdp(creds=None, port=CDP_PORT, deadline_s=180, verbose=True, auto_launch=True,
                 keep_open=False, settle_s=8):
     """Điểm danh qua Chrome THẬT: tự chạy Chrome (hồ sơ .chrome-profile đã đăng nhập) với remote
@@ -328,9 +346,17 @@ def checkin_cdp(creds=None, port=CDP_PORT, deadline_s=180, verbose=True, auto_la
                 page.goto(QUATANG_URL, wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(2500)
             if _is_login_page(page.url):
-                raise NeedsInteractiveLogin(
-                    "Chrome (CDP) chưa đăng nhập saffi. Chạy 1 lần: python saffi_checkin.py cdp-login"
-                )
+                # Phiên hồ sơ hết hạn → thử TỰ nạp lại từ creds.json rồi vào lại (khỏi cdp-login tay).
+                log("→ phiên Chrome hết hạn — thử tự nạp lại từ creds.json…")
+                _seed_cdp_session(ctx, page, creds)
+                page.goto(QUATANG_URL, wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_timeout(2500)
+                if _is_login_page(page.url):
+                    raise NeedsInteractiveLogin(
+                        "Chrome (CDP) chưa đăng nhập và creds.json cũng hết hạn. "
+                        "Chạy 1 lần: python saffi_checkin.py cdp-login"
+                    )
+                log("→ tự nạp phiên OK.")
             return _wait_and_click(page, captured, deadline_s, log)
     finally:
         if proc and not keep_open:
