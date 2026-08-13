@@ -1,0 +1,7 @@
+{
+  "csrf_token": "giá trị header x-csrf-token (hằng csrfToken trong HTML trang /rewards)",
+  "xeng_secret": "để trống — site đã đổi sang signing token động (GET /api/v2/security/signature-token)",
+  "user_id": "googleId của bạn (hoặc userEmail) — vế cuối trong chuỗi ký HMAC",
+  "cookies": "nguyên chuỗi Cookie của app.caffiliate.vn (copy from cURL)",
+  "user_agent": "header user-agent của Chrome bạn đang dùng"
+}
