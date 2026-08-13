@@ -21,6 +21,9 @@ import subprocess
 import sys
 import time
 import urllib.request
+from datetime import datetime, timedelta
+
+ICT_OFFSET_HOURS = 7  # server saffi reset theo 00:00 giờ VN (ICT = UTC+7)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROFILE_DIR = os.path.join(HERE, ".pw-profile")        # hồ sơ Chromium do Playwright quản (cách cũ)
@@ -194,8 +197,37 @@ def _find_checkin_button(page):
     return None, None
 
 
-def _attach_capture(page, captured):
-    """Bắt response POST /spoint/checkin để biết kết quả (thành công / đã điểm danh / lỗi)."""
+def _checkin_ict_date(checkin_date_str):
+    """checkin_date server ở UTC (vd '2026-08-11T17:00:00Z' = 00:00 ICT ngày 12). Trả 'YYYY-MM-DD'
+    theo lịch ICT, hoặc None nếu không parse được."""
+    if not checkin_date_str:
+        return None
+    try:
+        s = checkin_date_str.replace("Z", "")[:19]
+        dt = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S") + timedelta(hours=ICT_OFFSET_HOURS)
+        return dt.date().isoformat()
+    except Exception:
+        return None
+
+
+def _target_today_ict(now=None):
+    """Ngày ICT ta muốn điểm danh (nếu đang 23h thì là ngày mai)."""
+    now = now or datetime.now()
+    d = (now + timedelta(minutes=30)).date() if now.hour == 23 else now.date()
+    return d.isoformat()
+
+
+def _in_rollover_window(now=None):
+    """00:00–00:09 ICT: saffi CHƯA chắc đã rollover sang ngày mới (mở cửa ~00:03–00:08). Trong
+    khoảng này không tin trạng thái 'đã điểm danh' của trang (có thể là của ngày cũ)."""
+    now = now or datetime.now()
+    return now.hour == 0 and now.minute < 10
+
+
+def _attach_capture(page, captured, target=None):
+    """Bắt response POST /spoint/checkin. CHỈ coi là thành công khi checkin_date ĐÚNG ngày target
+    (ICT) — thành công cho ngày CŨ (server chưa rollover lúc ~00:00) chỉ đánh dấu recovered_prev
+    để vòng lặp tiếp tục chờ cửa hôm nay, tránh báo nhầm 'thành công' mà thực chưa điểm danh."""
     def on_response(resp):
         try:
             if CHECKIN_PATH in resp.url and resp.request.method == "POST":
@@ -207,9 +239,20 @@ def _attach_capture(page, captured):
                     body["httpError"] = resp.status
                 captured["last"] = body
                 ok = isinstance(body, dict) and (body.get("success") or body.get("status") == "success")
-                already = isinstance(body, dict) and resp.status in (409, 422)
-                if ok or already:
-                    captured["success"] = body
+                if ok:
+                    cd = ((body.get("data") or {}).get("checkin") or {}).get("checkin_date")
+                    d = _checkin_ict_date(cd)
+                    if target is None or d is None or d == target:
+                        captured["success"] = body
+                    else:
+                        captured["recovered_prev"] = True  # success NGÀY CŨ → chưa xong hôm nay
+                elif isinstance(body, dict) and resp.status in (409, 422):
+                    # 409/422 = "đã điểm danh". Trong cửa sổ rollover có thể là của ngày cũ → không
+                    # coi là xong; ngoài cửa sổ đó thì tin là đã điểm danh hôm nay.
+                    if not _in_rollover_window():
+                        captured["success"] = body
+                    else:
+                        captured["recovered_prev"] = True
         except Exception:
             pass
     page.on("response", on_response)
@@ -217,7 +260,8 @@ def _attach_capture(page, captured):
 
 def _wait_and_click(page, captured, deadline_s, log):
     """Logic site 2026-08: Turnstile invisible TỰ giải khi load (~5-7s); nút 'Chờ xác thực...' →
-    'Điểm danh ngay' khi token sẵn sàng → bấm 1 lần emit token thật. KHÔNG reload (reset xác thực)."""
+    'Điểm danh ngay' khi token sẵn sàng → bấm 1 lần emit token thật. KHÔNG reload (reset xác thực).
+    Chỉ dừng khi có checkin ĐÚNG ngày hôm nay (xem _attach_capture)."""
     deadline = time.time() + deadline_s
     attempts = 0
     last_reload = time.time()
@@ -228,12 +272,16 @@ def _wait_and_click(page, captured, deadline_s, log):
         _dismiss_popups(page)
         btn, label = _find_checkin_button(page)  # chỉ khớp 'Điểm danh ngay' (token đã sẵn)
         if btn is None:
-            if _checkin_state(page) == "done":
+            # 'done' NGOÀI cửa sổ rollover mới tin là đã điểm danh hôm nay. TRONG rollover (00:00–00:09)
+            # trang có thể báo "done" cho NGÀY CŨ → phải chờ cửa hôm nay mở, đừng dừng sớm.
+            if _checkin_state(page) == "done" and not _in_rollover_window():
                 log("ℹ️ Đã điểm danh hôm nay.")
                 return captured["success"] or {"success": True, "note": "already"}
             page.wait_for_timeout(300)  # poll sát để bấm gần như tức thì khi nút mở / cửa mở
-            if time.time() - last_reload > 45:  # chỉ reload khi kẹt quá lâu (token lỗi/không tới)
-                log("… kẹt lâu, reload để re-render Turnstile…")
+            # Lúc rollover reload nhanh hơn (bắt đúng thời điểm server mở cửa); ngoài ra reload chậm.
+            reload_gap = 12 if _in_rollover_window() else 45
+            if time.time() - last_reload > reload_gap:
+                log("… reload để bắt cửa mở / re-render Turnstile…")
                 try:
                     page.reload(wait_until="domcontentloaded", timeout=30000)
                     page.wait_for_timeout(2500)
@@ -248,7 +296,13 @@ def _wait_and_click(page, captured, deadline_s, log):
         while waited < 8 and not captured["success"]:
             page.wait_for_timeout(300)
             waited += 0.3
-    return captured["success"] or captured["last"]
+    # Hết deadline: ưu tiên success hôm nay; nếu chỉ vớt được ngày cũ → báo rõ CHƯA xong hôm nay.
+    if captured["success"]:
+        return captured["success"]
+    if captured.get("recovered_prev"):
+        return {"success": False, "recovered_prev": True,
+                "message": "Chỉ điểm danh được NGÀY CŨ — cửa hôm nay chưa mở kịp trong thời hạn."}
+    return captured["last"]
 
 
 # ---------- Chế độ CDP: Chrome THẬT (process riêng) + Playwright kết nối vào để bấm ----------
@@ -341,7 +395,7 @@ def checkin_cdp(creds=None, port=CDP_PORT, deadline_s=180, verbose=True, auto_la
             ctx = browser.contexts[0] if browser.contexts else browser.new_context()
             page = next((pg for pg in ctx.pages if SITE_HOST in pg.url), None)
             page = page or (ctx.pages[0] if ctx.pages else ctx.new_page())
-            _attach_capture(page, captured)
+            _attach_capture(page, captured, target=_target_today_ict())
             if "qua-tang" not in page.url:
                 page.goto(QUATANG_URL, wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(2500)
