@@ -1,5 +1,7 @@
 {
-  "fire_offset_ms": -200,
+  "fire_offset_ms": -40,
+  "burst_count": 8,
+  "burst_gap_ms": 35,
   "button_x": 1230,
   "button_y": 348,
   "button_region": [

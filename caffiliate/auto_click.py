@@ -18,7 +18,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, time as dt_time, timedelta
+from datetime import datetime, time as dt_time, timedelta, timezone
 
 import pyautogui
 
@@ -132,89 +132,175 @@ def click_via_cdp(button_id="btnCheckIn"):
         return False, f"{type(e).__name__}: {str(e)[:200]}"
 
 
-def fire_direct_post_via_cdp(fire_offset_ms=50):
-    """PRE-FETCH tất cả tokens (Turnstile, signing, csrf) TRƯỚC midnight, POST trực tiếp AT midnight+offset_ms.
-    Fire tại 00:00:00.050 → server nhận ~00:00:00.100 → new day → top 1-3.
+def fire_direct_post_via_cdp(fire_offset_ms=-40, burst_count=8, burst_gap_ms=35):
+    """PRE-FETCH tokens TRƯỚC midnight, calibrate giờ SERVER, warm connection, rồi BURST POST.
+
+    Cải tiến so với bản 1-phát:
+      1. Server-time calibration: probe header `Date` liên tục, bắt đúng khoảnh khắc giây
+         server nhảy (edge-detection) → ghim mốc giây server ±1 RTT. Header Date chỉ có độ
+         phân giải giây nên edge-detection là cách duy nhất lấy sub-second offset.
+      2. Warm connection: gửi HEAD ~1.5s trước fire để giữ TLS/HTTP2 alive, POST thật khỏi handshake.
+      3. Burst: bắn `burst_count` POST cách nhau `burst_gap_ms`, mỗi phát ts/nonce/signature RIÊNG,
+         canh sao cho các phát ĐẾN server trải quanh 00:00:00 server + fire_offset_ms.
+
+    fire_offset_ms = thời điểm ĐẾN server (ms) của phát đầu, so với midnight server.
+      Ví dụ -40 → phát đầu đến trước midnight 40ms (thường bị reject "hôm qua"), các phát sau
+      lần lượt +35ms rơi ngay sau midnight → phát hợp lệ đầu tiên thắng.
     Trả về (success, message)."""
     try:
         ws = _cdp_get_ws()
 
-        # 1. Inject setup + fire JS. Chạy trong browser context.
-        # Target time = next UTC midnight + 7h (ICT) + fire_offset_ms
-        # Since browser Date is client-local, use local midnight tomorrow + offset
         js = r"""
         (async function(){
+            const LOG = [];
+            function log(m){ LOG.push(m); }
             try {
-                // Extract creds từ HTML (const app.state không expose ra window)
+                const FIRE_OFFSET_MS = __FIRE_OFFSET__;   // arrival của phát đầu, so với server midnight
+                const BURST_N        = __BURST_N__;
+                const BURST_GAP_MS   = __BURST_GAP__;
+
+                // ---- creds ----
                 const html = document.documentElement.outerHTML;
                 const csrfMatch = html.match(/csrfToken:\s*'([^']+)'/);
                 const userIdMatch = html.match(/googleId:\s*'([^']+)'/);
-                if (!csrfMatch || !userIdMatch) return {ok:false, err:'creds regex fail'};
+                if (!csrfMatch || !userIdMatch) return {ok:false, err:'creds regex fail', log:LOG};
                 const csrfToken = csrfMatch[1];
                 const userId = userIdMatch[1];
 
-                // Fetch signing token
+                // ---- signing token ----
                 const signResp = await fetch('/api/v2/security/signature-token', {credentials:'same-origin', cache:'no-store'}).then(r=>r.json());
-                if (!signResp.success || !signResp.data || !signResp.data.signatureToken) return {ok:false, err:'signing token fail: '+JSON.stringify(signResp).slice(0,150)};
+                if (!signResp.success || !signResp.data || !signResp.data.signatureToken) return {ok:false, err:'signing token fail: '+JSON.stringify(signResp).slice(0,150), log:LOG};
                 const signingToken = signResp.data.signatureToken;
 
-                // Get Turnstile token
-                if (!window.CheckInTurnstile || typeof window.CheckInTurnstile.getToken !== 'function') return {ok:false, err:'CheckInTurnstile not loaded'};
+                // ---- Turnstile token ----
+                if (!window.CheckInTurnstile || typeof window.CheckInTurnstile.getToken !== 'function') return {ok:false, err:'CheckInTurnstile not loaded', log:LOG};
                 const tsToken = await window.CheckInTurnstile.getToken();
-                if (!tsToken) return {ok:false, err:'Turnstile getToken empty'};
+                if (!tsToken) return {ok:false, err:'Turnstile getToken empty', log:LOG};
 
-                // Compute fire target: next midnight local + FIRE_OFFSET_MS
-                const now = new Date();
-                const target = new Date(now);
-                target.setHours(24, 0, 0, FIRE_OFFSET_MS_PLACEHOLDER);
-
-                // Wait until target
-                while (Date.now() < target.getTime()) {
-                    const rem = target.getTime() - Date.now();
-                    if (rem > 100) await new Promise(r=>setTimeout(r, rem-50));
-                    else await new Promise(r=>setTimeout(r, 1));
+                // ---- import HMAC key 1 lần, dùng lại cho mọi phát ----
+                const encoder = new TextEncoder();
+                const hmacKey = await crypto.subtle.importKey('raw', encoder.encode(signingToken), {name:'HMAC',hash:'SHA-256'}, false, ['sign']);
+                async function makeSig(ts, nonce){
+                    const sig = await crypto.subtle.sign('HMAC', hmacKey, encoder.encode(ts + '.' + nonce + '.' + userId));
+                    return Array.from(new Uint8Array(sig)).map(b=>b.toString(16).padStart(2,'0')).join('');
                 }
 
-                // Compute signature RIGHT BEFORE fire
-                const ts = Date.now().toString();
-                const nonce = Math.random().toString(36).substring(2, 15);
-                const baseString = ts + '.' + nonce + '.' + userId;
-                const encoder = new TextEncoder();
-                const key = await crypto.subtle.importKey('raw', encoder.encode(signingToken), {name:'HMAC',hash:'SHA-256'}, false, ['sign']);
-                const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(baseString));
-                const sigHex = Array.from(new Uint8Array(sig)).map(b=>b.toString(16).padStart(2,'0')).join('');
+                // ---- nominal midnight (calendar-based, không lệ thuộc clock skew) ----
+                const N = (function(){ const d = new Date(); d.setHours(24,0,0,0); return d.getTime(); })();
 
-                // FIRE
-                const fireStart = Date.now();
-                const res = await fetch('/api/v2/xeng/check-in-secure', {
-                    method: 'POST',
-                    credentials: 'same-origin',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'x-csrf-token': csrfToken,
-                        'x-signature': sigHex,
-                        'x-timestamp': ts,
-                        'x-nonce': nonce
-                    },
-                    body: JSON.stringify({'cf-turnstile-response': tsToken})
-                }).then(r=>r.json()).catch(e=>({success:false, error:String(e)}));
-                const fireEnd = Date.now();
+                // ---- coarse wait tới ~T-9s trước khi calibrate (calibrate gần fire cho chuẩn RTT) ----
+                while (Date.now() < N - 9000) {
+                    const rem = N - 9000 - Date.now();
+                    await new Promise(r=>setTimeout(r, Math.min(rem, 5000)));
+                }
+
+                // ---- CALIBRATION: edge-detection giây server qua header Date ----
+                async function probe(){
+                    const t0 = Date.now();
+                    let dh = null;
+                    try {
+                        const r = await fetch('/api/v2/security/signature-token', {method:'HEAD', cache:'no-store', credentials:'same-origin'});
+                        dh = r.headers.get('date');
+                    } catch(e){}
+                    const t1 = Date.now();
+                    const serverMs = dh ? new Date(dh).getTime() : null; // giây, .000
+                    return {serverMs, mid:(t0+t1)/2, rtt:t1-t0};
+                }
+                function median(arr){ const s=arr.slice().sort((a,b)=>a-b); const m=Math.floor(s.length/2); return s.length%2 ? s[m] : (s[m-1]+s[m])/2; }
+                let prevSec = null, prevMid = null, minRtt = 99999, samples = 0;
+                const edgeOffsets = [];
+                const calDeadline = N - 3500;  // ~5.5s probing
+                while (Date.now() < calDeadline) {
+                    const p = await probe();
+                    samples++;
+                    if (p.serverMs === null) continue;
+                    if (p.rtt < minRtt) minRtt = p.rtt;
+                    if (prevSec !== null && p.serverMs > prevSec) {
+                        // giây server nhảy giữa probe trước (prevMid) và probe này (p.mid).
+                        // Mốc .000 của giây mới nằm TRONG khoảng (prevMid, p.mid) → ước lượng tốt nhất = trung điểm.
+                        // Sai số = ±(p.mid-prevMid)/2 = ±nửa probe gap (~vài chục ms) thay vì cả 1 giây.
+                        const boundaryLocal = (prevMid + p.mid) / 2;
+                        edgeOffsets.push(p.serverMs - boundaryLocal);
+                    }
+                    prevSec = p.serverMs;
+                    prevMid = p.mid;
+                }
+                let offset;
+                if (edgeOffsets.length) {
+                    offset = median(edgeOffsets);  // median chống outlier từ probe bị mạng giật
+                } else {
+                    // không bắt được edge → fallback coarse: dùng probe cuối (±1s). RỦI RO nếu clock lệch lớn.
+                    const p = await probe();
+                    if (p.serverMs !== null) { offset = p.serverMs - p.mid; log('WARN: no edge, coarse offset ±1s'); }
+                    else return {ok:false, err:'calibration fail: no Date header', log:LOG};
+                }
+                const edges = edgeOffsets.length;
+                const oneWay = minRtt / 2;
+                const spread = edges >= 2 ? Math.round(Math.max.apply(null,edgeOffsets)-Math.min.apply(null,edgeOffsets)) : 0;
+                log('cal: offset='+Math.round(offset)+'ms minRtt='+minRtt+'ms edges='+edges+' spread='+spread+'ms samples='+samples);
+
+                // ---- lịch fire: send_local_k = (N - offset) - oneWay + FIRE_OFFSET_MS + k*GAP ----
+                const sendBase = (N - offset) - oneWay + FIRE_OFFSET_MS;
+                const sends = [];
+                for (let k=0;k<BURST_N;k++) sends.push(sendBase + k*BURST_GAP_MS);
+
+                // ---- warm connection ~1.5s trước phát đầu ----
+                const warmAt = sends[0] - 1500;
+                while (Date.now() < warmAt) await new Promise(r=>setTimeout(r, Math.min(warmAt-Date.now(), 300)));
+                try { await fetch('/api/v2/security/signature-token', {method:'HEAD', cache:'no-store', credentials:'same-origin'}); log('warm sent'); } catch(e){}
+
+                // ---- BURST ----
+                async function fireOne(k){
+                    const sendTgt = sends[k];
+                    while (Date.now() < sendTgt) {
+                        const rem = sendTgt - Date.now();
+                        if (rem > 3) await new Promise(r=>setTimeout(r, 1));
+                        // else spin
+                    }
+                    const ts = Date.now().toString();
+                    const nonce = Math.random().toString(36).substring(2, 15) + k;
+                    const sigHex = await makeSig(ts, nonce);
+                    const t0 = Date.now();
+                    let res;
+                    try {
+                        res = await fetch('/api/v2/xeng/check-in-secure', {
+                            method: 'POST', credentials: 'same-origin',
+                            headers: {'Content-Type':'application/json','x-csrf-token':csrfToken,'x-signature':sigHex,'x-timestamp':ts,'x-nonce':nonce},
+                            body: JSON.stringify({'cf-turnstile-response': tsToken})
+                        }).then(r=>r.json());
+                    } catch(e){ res = {success:false, error:String(e)}; }
+                    const t1 = Date.now();
+                    let raw;
+                    try { raw = JSON.stringify(res).slice(0,180); } catch(e){ raw = String(res).slice(0,180); }
+                    return {
+                        k, sentSrv: Math.round(t0 + offset), lat: t1-t0,
+                        ok: !!res.success,
+                        pos: res && res.data ? (res.data.position || res.data.todayCheckInPosition) : undefined,
+                        err: res && res.success ? undefined : String((res&&(res.error||res.message))||'').slice(0,80),
+                        raw: raw
+                    };
+                }
+                // schedule tất cả, chờ xong hết
+                const results = await Promise.all(Array.from({length:BURST_N}, (_,k)=>fireOne(k)));
+                const winner = results.find(r=>r.ok);
 
                 return {
-                    ok: !!res.success,
-                    fireStart: new Date(fireStart).toISOString(),
-                    fireEnd: new Date(fireEnd).toISOString(),
-                    latencyMs: fireEnd - fireStart,
-                    response: res
+                    ok: !!winner,
+                    offsetMs: Math.round(offset), minRttMs: minRtt, edges, spreadMs: spread,
+                    fireStart: new Date(Math.round(sendBase)).toISOString(),
+                    winner: winner || null,
+                    results,
+                    log: LOG
                 };
             } catch (e) {
-                return {ok:false, err:'exception: '+String(e).slice(0,200)};
+                return {ok:false, err:'exception: '+String(e).slice(0,200), log:LOG};
             }
         })()
-        """.replace("FIRE_OFFSET_MS_PLACEHOLDER", str(int(fire_offset_ms)))
+        """.replace("__FIRE_OFFSET__", str(int(fire_offset_ms))) \
+           .replace("__BURST_N__", str(int(burst_count))) \
+           .replace("__BURST_GAP__", str(int(burst_gap_ms)))
 
-        # JS block cho tới midnight+offset. Từ 23:57 tới 00:00 = ~183s.
-        # WS timeout = 300s (5 min) để cover cả preload + wait + fire + response.
+        # JS block cho tới sau midnight. Từ 23:57 tới fire = ~183s + burst.
         ws.send(json.dumps({
             "id": 1,
             "method": "Runtime.evaluate",
@@ -225,10 +311,30 @@ def fire_direct_post_via_cdp(fire_offset_ms=50):
         ws.close()
 
         value = result.get("result", {}).get("result", {}).get("value", {})
+        # Tóm tắt burst gọn cho Telegram
+        results = value.get("results") or []
+        brief = " ".join(
+            f"#{r.get('k')}:{'OK' if r.get('ok') else 'x'}"
+            + (f"p{r.get('pos')}" if r.get('pos') is not None else "")
+            for r in results
+        )
+        # Nhóm response theo raw text → thấy rõ endpoint nói gì HAI PHÍA ranh giới (data cho bước 2)
+        groups = {}
+        for r in results:
+            raw = r.get("raw") or r.get("err") or "?"
+            groups.setdefault(raw, []).append(r.get("k"))
+        resp_block = " || ".join(
+            f"#{','.join(str(k) for k in ks)}: {raw}" for raw, ks in groups.items()
+        )
+        cal = f"offset={value.get('offsetMs')}ms rtt={value.get('minRttMs')}ms edges={value.get('edges')} spread={value.get('spreadMs')}ms"
         if value.get("ok"):
-            return True, f"FIRE OK | fireStart={value.get('fireStart')} | latency={value.get('latencyMs')}ms | response={json.dumps(value.get('response'))[:200]}"
+            w = value.get("winner") or {}
+            return True, f"FIRE OK | {cal} | winner #{w.get('k')} pos={w.get('pos')} lat={w.get('lat')}ms | burst[{brief}]\n📋 resp: {resp_block[:600]}"
         else:
-            return False, f"FIRE FAIL | value={json.dumps(value)[:400]}"
+            err = value.get("err")
+            if err:
+                return False, f"FIRE FAIL | {err} | log={value.get('log')}"
+            return False, f"FIRE FAIL | {cal} | burst[{brief}]\n📋 resp: {resp_block[:600]}\nlog={value.get('log')}"
     except Exception as e:
         return False, f"{type(e).__name__}: {str(e)[:200]}"
 
@@ -275,6 +381,29 @@ def reload_and_click_via_cdp(button_id="btnCheckIn", max_attempts=15, poll_inter
         return False, f"Poll {max_attempts} lần button vẫn disabled/not-found"
     except Exception as e:
         return False, f"{type(e).__name__}: {str(e)[:200]}"
+
+
+def cdp_check_logged_in(timeout=25):
+    """Poll CDP tabs sau khi launch. Trả về (ok, detail).
+    ok=True nếu tìm thấy tab caffiliate ĐANG ở /rewards (đã login).
+    ok=False + detail='login' nếu bị redirect về /login (session hết hạn).
+    ok=False + detail='no-tab' nếu chưa thấy tab nào (Chrome chưa load / CDP chưa sẵn sàng)."""
+    import urllib.request
+    deadline = time.time() + timeout
+    last = "no-tab"
+    while time.time() < deadline:
+        try:
+            tabs = json.loads(urllib.request.urlopen(
+                f"http://localhost:{CDP_PORT}/json", timeout=5).read())
+            pages = [t.get("url", "").lower() for t in tabs if t.get("type") == "page"]
+            if any("caffiliate" in u and "rewards" in u for u in pages):
+                return True, "rewards"
+            if any("caffiliate" in u and "login" in u for u in pages):
+                last = "login"
+        except Exception:
+            pass
+        time.sleep(1)
+    return False, last
 
 
 def kill_chrome():
@@ -402,9 +531,107 @@ def cmd_test():
     time.sleep(5)
 
 
+def _http_server_datetime():
+    """Lấy giờ SERVER caffiliate (UTC, tz-aware) từ header Date qua HTTPS. None nếu fail.
+    Dùng HTTPS thay vì NTP vì máy này NTP client hỏng + mạng rớt UDP 123; header Date luôn lấy được."""
+    import urllib.request
+    from email.utils import parsedate_to_datetime
+    try:
+        req = urllib.request.Request(REWARDS_URL, method="HEAD")
+        with urllib.request.urlopen(req, timeout=8) as r:
+            date_hdr = r.headers.get("Date")
+        if not date_hdr:
+            return None
+        return parsedate_to_datetime(date_hdr)  # tz-aware (GMT)
+    except Exception:
+        return None
+
+
+def _http_date_offset(url):
+    """Fetch HEAD, trả (offset_ms, None) với offset = server_Date_ms - local_mid_ms; hoặc (None, err).
+    offset đo tương đối so với CÙNG clock local nên hiệu giữa các nguồn triệt tiêu clock máy."""
+    import urllib.request
+    from email.utils import parsedate_to_datetime
+    try:
+        req = urllib.request.Request(url, method="HEAD", headers={
+            "Cache-Control": "no-cache",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        })
+        t0 = time.time()
+        with urllib.request.urlopen(req, timeout=8) as r:
+            date_hdr = r.headers.get("Date")
+        t1 = time.time()
+        if not date_hdr:
+            return None, "no Date header"
+        server_ms = parsedate_to_datetime(date_hdr).timestamp() * 1000.0
+        mid_ms = (t0 + t1) / 2 * 1000.0
+        return server_ms - mid_ms, None
+    except Exception as e:
+        return None, f"{type(e).__name__}"
+
+
+def detect_clock_skew():
+    """So header Date của caffiliate với các nguồn HTTPS ĐỘC LẬP (Google, Cloudflare).
+    Nếu caffiliate lệch khỏi nhóm kia > ~2s → caffi có thể đang skew giờ để bẫy tool. Trả (skewed, detail).
+    Vì mỗi offset đo so với cùng clock máy, hiệu số triệt tiêu sai số clock máy → phát hiện được dù máy lệch."""
+    caffi, e_caffi = _http_date_offset(REWARDS_URL)
+    ref_urls = ["https://www.google.com/", "https://www.cloudflare.com/",
+                "https://www.bing.com/", "https://www.microsoft.com/"]
+    refs = [x for x in (_http_date_offset(u)[0] for u in ref_urls) if x is not None]
+    if caffi is None:
+        return False, f"caffi fail ({e_caffi})"
+    if not refs:
+        return False, "không có nguồn tham chiếu (Google/CF fail)"
+    ref = sorted(refs)[len(refs) // 2]  # median các nguồn tham chiếu
+    div = caffi - ref  # ms
+    # Header Date chỉ tới giây → nhiễu ±1s bình thường; cờ khi > 2s
+    skewed = abs(div) > 2000
+    return skewed, f"caffi vs refs divergence={div/1000:.1f}s (caffi_off={caffi/1000:.1f}s ref_off={ref/1000:.1f}s, n_ref={len(refs)})"
+
+
+def sync_windows_clock():
+    """Sync đồng hồ Windows theo giờ SERVER caffiliate qua header Date (HTTPS, KHÔNG dùng NTP/UDP).
+    Trả về (ok, detail). Cần Task Scheduler chạy quyền admin (SetSystemTime yêu cầu SE_SYSTEMTIME).
+
+    Bối cảnh: máy này lệch ~10.4s (đo 2026-08-11) và w32tm/NTP không sync được (mạng rớt UDP 123).
+    Header Date chỉ chính xác tới GIÂY → OS còn lệch ≤1s, nhưng đủ vai trò lưới an toàn; calibration
+    lúc fire vẫn tự bù phần dưới giây. Mục tiêu chỉ là tránh lệch cả chục giây khi calibration miss edge."""
+    import ctypes
+    import ctypes.wintypes as wt
+    try:
+        dt = _http_server_datetime()
+        if dt is None:
+            return False, "không lấy được header Date (mạng?)"
+        u = dt.astimezone(timezone.utc)
+
+        class SYSTEMTIME(ctypes.Structure):
+            _fields_ = [("wYear", wt.WORD), ("wMonth", wt.WORD), ("wDayOfWeek", wt.WORD),
+                        ("wDay", wt.WORD), ("wHour", wt.WORD), ("wMinute", wt.WORD),
+                        ("wSecond", wt.WORD), ("wMilliseconds", wt.WORD)]
+
+        st = SYSTEMTIME(u.year, u.month, 0, u.day, u.hour, u.minute, u.second, 0)
+        before = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        ok = ctypes.windll.kernel32.SetSystemTime(ctypes.byref(st))  # SetSystemTime nhận UTC
+        if ok:
+            after = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            return True, f"UTC={u.strftime('%H:%M:%S')} | local {before}→{after}"
+        err = ctypes.windll.kernel32.GetLastError()
+        return False, f"SetSystemTime fail err={err} (cần quyền admin)"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e)[:150]}"
+
+
 def cmd_run():
     """Production: task scheduler chạy lệnh này ~23:57."""
     print(f"=== RUN MODE ({datetime.now()}) ===")
+
+    # 0. Sync clock TRƯỚC (cần chạy Task Scheduler với quyền admin để SetSystemTime ăn).
+    sync_ok, sync_detail = sync_windows_clock()
+    print(f"[clock sync] ok={sync_ok} | {sync_detail}")
+
+    # 0b. Dò skew: caffi có đang chỉnh giờ nhanh/chậm để bẫy tool không?
+    skewed, skew_detail = detect_clock_skew()
+    print(f"[skew] skewed={skewed} | {skew_detail}")
 
     cfg = load_config()
     offset_ms = cfg.get("fire_offset_ms", FIRE_OFFSET_MS)
@@ -418,11 +645,30 @@ def cmd_run():
         return
 
     # 1. Launch Chrome ngay
-    send_telegram(f"🟢 Bắt đầu auto-click ngày {now.strftime('%Y-%m-%d')} — launch Chrome...")
+    clock_note = f"🕐 clock synced ({sync_detail[:60]})" if sync_ok else f"⚠️ clock sync FAIL ({sync_detail[:80]}) — Task cần quyền admin?"
+    skew_note = f"🚨 CAFFI SKEW GIỜ: {skew_detail}" if skewed else f"🧭 skew check OK: {skew_detail}"
+    send_telegram(f"🟢 Bắt đầu auto-click ngày {now.strftime('%Y-%m-%d')} — launch Chrome...\n{clock_note}\n{skew_note}")
     launch_chrome()
 
     # 2. Chờ Chrome load + Turnstile pass (~30s)
     time.sleep(20)
+
+    # 2b. Check session: nếu bị redirect về /login → báo NGAY để đăng nhập tay
+    #     kịp trước midnight (còn ~3 phút), thay vì fail lúc fire.
+    ok_login, detail = cdp_check_logged_in(timeout=25)
+    if not ok_login:
+        if detail == "login":
+            send_telegram(
+                "🔴 SESSION HẾT HẠN! Tab đang ở /login. "
+                "Đăng nhập TAY vào Chrome NGAY (còn vài phút trước 00:00) để cứu streak. "
+                "Profile: C:\\SeleniumChromeProfile"
+            )
+        else:
+            send_telegram(
+                f"🟠 Chưa thấy tab caffiliate/rewards qua CDP (detail={detail}). "
+                "Kiểm tra Chrome đã mở đúng chưa."
+            )
+        # Không return — vẫn thử fire, vì user có thể đăng nhập tay kịp lúc.
 
     # 3. Locate button — thử screen match, fallback cached coords (dùng khi lock screen)
     pos = wait_for_button(timeout=15)
@@ -440,17 +686,17 @@ def cmd_run():
         send_telegram(f"📍 Locked nút (screen match) tại {pos}. Chờ tới midnight{offset_ms:+d}ms...")
 
     # 4. FIRE approach: inject JS vào Chrome. JS sẽ:
-    #    - Extract creds từ HTML
-    #    - Fetch signing token + Turnstile token TRƯỚC midnight
-    #    - Wait until 00:00:00 + offset_ms (bên trong browser)
-    #    - Fire POST /check-in-secure trực tiếp
-    #    → Fire chính xác 00:00:00.050 (client), server nhận ~+30-100ms → top 1-3
-    # Test aggressive: fire pre-midnight. Turnstile token có TTL 5min nên OK.
-    # Nếu server reject "đã điểm hôm qua" → biết được server không queue → revert offset.
-    # Cứu streak: bạn click tay sáng hôm sau nếu fail.
-    fire_offset_ms = -500  # sweet spot: top 5-8 ceiling từ home + Turnstile
-    send_telegram(f"🚀 Inject fire JS. Sẽ fire tại midnight{fire_offset_ms:+d}ms.")
-    ok, msg = fire_direct_post_via_cdp(fire_offset_ms=fire_offset_ms)
+    #    - Extract creds + fetch signing/Turnstile token TRƯỚC midnight
+    #    - CALIBRATE giờ server (edge-detection header Date) → offset + RTT
+    #    - Warm connection ~1.5s trước fire
+    #    - BURST nhiều POST canh ĐẾN server quanh 00:00:00 server + fire_offset_ms
+    #    → không lệ thuộc clock máy; chịu được jitter; log offset/RTT/pos để tinh chỉnh.
+    # fire_offset_ms ở đây = arrival của phát ĐẦU so với midnight server (âm = trước, để phát sau bắt boundary).
+    fire_offset_ms = cfg.get("fire_offset_ms", -40)
+    burst_count = cfg.get("burst_count", 8)
+    burst_gap_ms = cfg.get("burst_gap_ms", 35)
+    send_telegram(f"🚀 Inject fire JS. Calibrate+burst {burst_count} phát, arrival phát đầu = midnight{fire_offset_ms:+d}ms server, gap {burst_gap_ms}ms.")
+    ok, msg = fire_direct_post_via_cdp(fire_offset_ms=fire_offset_ms, burst_count=burst_count, burst_gap_ms=burst_gap_ms)
     if ok:
         send_telegram(f"🖱️ {msg[:500]}")
     else:
