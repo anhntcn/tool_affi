@@ -22,6 +22,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROFILE_DIR = os.path.join(HERE, ".pw-profile")  # hồ sơ Chromium bền (giữ phiên Google) — .gitignore
 SITE_URL = "https://hoantienshopee.me/"
+LOGIN_URL = "https://hoantienshopee.me/dang-nhap"
 API_HOST = "api.hoantienshopee.me"
 REFRESH_COOKIE = "shop_refresh_token"
 
@@ -60,11 +61,73 @@ def _refresh_cookie(ctx):
     return None
 
 
-def acquire(user_agent, headless=True, wait_login_s=30, settle_s=4):
-    """Mở trình duyệt (hồ sơ bền) → chờ đăng nhập → trả {access_token, refresh_token}.
+def _wait_login(ctx, page, captured, wait_s):
+    """Poll tới khi có refresh cookie + access token, hoặc hết wait_s. Trả về refresh token (hoặc None)."""
+    deadline = time.time() + wait_s
+    rt = None
+    while time.time() < deadline:
+        rt = _refresh_cookie(ctx)
+        if rt and captured["access"]:
+            return rt
+        page.wait_for_timeout(500)
+    return rt
 
-    - headless=True: dùng cho lần chạy tự động (Task Scheduler). Nếu chưa đăng nhập sẵn thì
-      raise NeedsInteractiveLogin.
+
+def _drive_google_oauth(ctx, page):
+    """Tự lái OAuth Google khi phiên Google CÒN sống nhưng site cần bấm nút để đăng nhập.
+
+    hoantien không auto-login lúc load trang: phải mở /dang-nhap → 'Tiếp tục với Google' →
+    (chọn tài khoản) → (consent 'Tiếp tục'). Với phiên Google còn hạn, cả 2 bước này không cần
+    mật khẩu nên headless tự làm được. Nếu Google đòi mật khẩu/2FA thì các bước dưới sẽ không
+    tìm thấy nút → bỏ qua, caller sẽ raise NeedsInteractiveLogin để nhắc chạy browser-login tay.
+    Best-effort: mọi bước bọc try/except, không ném lỗi ra ngoài."""
+    try:
+        page.goto(LOGIN_URL, wait_until="networkidle", timeout=45000)
+        page.wait_for_timeout(1200)
+        btn = page.query_selector("button:has-text('Tiếp tục với Google')") or \
+            page.query_selector("button:has-text('Google')")
+        if not btn:
+            return
+        # Nút Google thường mở popup; đôi khi redirect cùng tab.
+        pop = None
+        try:
+            with ctx.expect_page(timeout=8000) as pop_info:
+                btn.click()
+            pop = pop_info.value
+        except Exception:
+            pop = page  # không có popup → OAuth chạy ngay trên tab hiện tại
+        surface = pop
+        try:
+            surface.wait_for_load_state("domcontentloaded", timeout=20000)
+        except Exception:
+            pass
+        surface.wait_for_timeout(1500)
+
+        # Bước chọn tài khoản (có thể bị bỏ qua nếu chỉ 1 tài khoản) — click ô có email.
+        try:
+            surface.click("text=/@[\\w.\\-]+/", timeout=8000)
+        except Exception:
+            pass
+
+        # Bước consent — nút 'Tiếp tục' / 'Continue'.
+        for label in ("Tiếp tục", "Continue", "Allow", "Cho phép"):
+            try:
+                surface.wait_for_selector(f"button:has-text('{label}')", timeout=6000)
+                surface.click(f"button:has-text('{label}')")
+                break
+            except Exception:
+                continue
+    except Exception:
+        pass  # để caller quyết định qua việc có cookie hay không
+
+
+def acquire(user_agent, headless=True, wait_login_s=30, settle_s=4, drive=True):
+    """Mở trình duyệt (hồ sơ bền) → đăng nhập → trả {access_token, refresh_token}.
+
+    - headless=True: dùng cho lần chạy tự động (Task Scheduler).
+    - drive=True: nếu chưa đăng nhập sẵn, TỰ lái OAuth Google (chọn tài khoản + consent) bằng
+      phiên Google đã lưu trong .pw-profile. Chỉ khi Google đòi mật khẩu/2FA mới raise
+      NeedsInteractiveLogin (→ nhắc chạy browser-login tay 1 lần).
     - Chộp access token từ header `Authorization: Bearer` của BẤT KỲ request nào tới API
       (bền vững, khỏi cần biết SPA lưu token ở đâu). Lấy bản mới nhất (server xoay token liên tục).
     """
@@ -100,18 +163,18 @@ def acquire(user_agent, headless=True, wait_login_s=30, settle_s=4):
             wire(page)
             page.goto(SITE_URL, wait_until="domcontentloaded", timeout=45000)
 
-            # Chờ tới khi có cookie refresh (dấu hiệu đã đăng nhập) VÀ chộp được access token.
-            deadline = time.time() + wait_login_s
-            rt = None
-            while time.time() < deadline:
-                rt = _refresh_cookie(ctx)
-                if rt and captured["access"]:
-                    break
-                page.wait_for_timeout(500)
+            # 1. Fast-path: phiên site còn sống → cookie xuất hiện ngay (chờ ngắn).
+            rt = _wait_login(ctx, page, captured, min(wait_login_s, 8))
+
+            # 2. Chưa có cookie mà được phép drive → tự lái OAuth Google rồi chờ lại.
+            if not rt and drive:
+                _drive_google_oauth(ctx, page)
+                rt = _wait_login(ctx, page, captured, wait_login_s)
 
             if not rt:
                 raise NeedsInteractiveLogin(
-                    "Chưa đăng nhập trong hồ sơ trình duyệt. Chạy: python hoantien_checkin.py browser-login"
+                    "Không tự đăng nhập được (Google có thể đòi xác minh). "
+                    "Chạy: python hoantien_checkin.py browser-login"
                 )
 
             # Có cookie nhưng chưa chộp được Bearer → nán thêm cho app gọi API rồi thử lại.
@@ -125,6 +188,48 @@ def acquire(user_agent, headless=True, wait_login_s=30, settle_s=4):
             return {"access_token": captured["access"], "refresh_token": rt}
         finally:
             ctx.close()  # đóng để Chromium lưu lại hồ sơ (phiên Google) vào .pw-profile
+
+
+def open_interactive(user_agent, keep_open_s=3600):
+    """Mở CỬA SỔ THẬT bằng đúng hồ sơ .pw-profile (đã đăng nhập Google) để bạn tự thao tác.
+
+    Dùng khi muốn vào hoantienshopee.me làm việc mà KHÔNG phải đăng nhập lại: hồ sơ này
+    chính là phiên tool đang giữ → không làm nhảy `ver`, không giết phiên tool.
+
+    Cửa sổ mở tới khi bạn tự đóng (hoặc tối đa keep_open_s giây). ĐÓNG cửa sổ khi xong để
+    Chromium lưu phiên và nhả khoá hồ sơ — nếu để mở lúc 00:00 thì lần chạy tự động (headless)
+    sẽ không mở được cùng hồ sơ (profile bị khoá).
+    """
+    from playwright.sync_api import sync_playwright
+
+    print(
+        "→ Cửa sổ đang mở bằng hồ sơ đã đăng nhập hoantien. Thao tác thoải mái.\n"
+        "  ⚠️ ĐÓNG cửa sổ khi xong (nhất là trước 23:55) để tool tự chạy được lúc 00:00."
+    )
+    with sync_playwright() as p:
+        ctx = p.chromium.launch_persistent_context(
+            PROFILE_DIR,
+            headless=False,
+            user_agent=user_agent,
+            viewport={"width": 1280, "height": 800},
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        closed = {"v": False}
+        ctx.on("close", lambda: closed.__setitem__("v", True))
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto(SITE_URL, wait_until="domcontentloaded", timeout=45000)
+
+        deadline = time.time() + keep_open_s
+        while not closed["v"] and time.time() < deadline:
+            try:
+                page.wait_for_timeout(1000)
+            except Exception:
+                break  # user đã đóng cửa sổ → context chết
+        try:
+            ctx.close()
+        except Exception:
+            pass
+    return {"ok": True}
 
 
 def interactive_setup(user_agent, wait_login_s=300):
@@ -155,8 +260,11 @@ if __name__ == "__main__":
         got = interactive_setup(ua)
     elif cmd == "test":
         got = acquire(ua, headless=True)
+    elif cmd == "open":
+        open_interactive(ua)
+        sys.exit(0)  # chỉ mở để thao tác, không cần in token
     else:
-        sys.exit("Dùng: setup | test")
+        sys.exit("Dùng: setup | test | open")
     tok = got.get("access_token")
     left = _jwt_seconds_left(tok) if tok else None
     print(json.dumps({

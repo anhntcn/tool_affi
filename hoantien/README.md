@@ -47,6 +47,12 @@ phải copy cURL tay nữa**.
   `python hoantien_checkin.py browser-login` mở tay 1 lần rồi lại tự chạy như cũ.
 - `.pw-profile/` chứa phiên Google → đã `.gitignore`, **tuyệt đối không commit / chia sẻ**.
 
+**Muốn tự vào web hoantien làm việc?** Chạy `python hoantien_checkin.py browser-open` — mở đúng
+hồ sơ đã đăng nhập (khỏi login lại). Vì cơ chế "1 tài khoản = 1 phiên", **đừng** đăng nhập
+hoantien trên trình duyệt riêng (làm `ver` nhảy, giết phiên tool); dùng `browser-open` thay thế.
+⚠️ **Đóng cửa sổ trước 23:55** — nếu để mở lúc 00:00, bản chạy tự động (headless) không mở được
+cùng hồ sơ (bị khoá profile) → lỡ điểm danh. Cửa sổ cũng tự đóng sau 1 giờ.
+
 Cách cũ (copy cURL tay) vẫn dùng được để mồi token lần đầu, nhưng sẽ chết mỗi khi bạn vào web —
 `browser-login` là cách bền.
 
@@ -75,6 +81,7 @@ python hoantien_checkin.py run        # chờ tới 00:00 ICT rồi burst — d�
 python hoantien_checkin.py status     # xem tình trạng + leaderboard (không điểm danh)
 python hoantien_checkin.py refresh    # refresh access token thủ công rồi lưu creds.json
 python hoantien_checkin.py browser-login    # LẦN ĐẦU: mở cửa sổ, đăng nhập Google, lưu hồ sơ
+python hoantien_checkin.py browser-open     # mở cửa sổ ĐÃ đăng nhập để tự thao tác web (không login lại)
 python hoantien_checkin.py browser-refresh  # thử tự lấy token headless từ hồ sơ đã lưu
 python hoantien_checkin.py tasks      # claim nhiệm vụ hàng ngày (đăng nhập +100đ…) NGAY
 python hoantien_checkin.py tasks-run  # ngủ ngẫu nhiên (≤5h) rồi claim — dùng cho Task Scheduler
@@ -87,9 +94,9 @@ Site có nhiệm vụ "Đăng nhập mỗi ngày" (+100đ) và các nhiệm vụ
 `ruleType=login_day` / `category=hang_ngay`, bỏ cái `da_nhan` đã nhận và `dang_lam` cần thao tác
 thật) rồi claim. Không cần đúng nửa đêm — chạy bất kỳ lúc nào trong ngày.
 
-Task Scheduler chạy `tasks-run` lúc **08:00**, script tự **ngủ ngẫu nhiên tới 5 giờ** rồi mới
-claim → mỗi ngày chạy một giờ khác nhau (08:00–13:00) để tránh bị phát hiện. Chỉnh khoảng ngẫu
-nhiên bằng `TASKS_RANDOM_DELAY_MAX_S`.
+Task Scheduler chạy `tasks-run` lúc **07:00**, script tự **ngủ ngẫu nhiên 1–10 phút** rồi mới
+claim → mỗi ngày chạy một giờ khác nhau (07:01–07:10) để tránh bị phát hiện. Chỉnh khoảng ngẫu
+nhiên bằng `TASKS_RANDOM_DELAY_MIN_S` / `TASKS_RANDOM_DELAY_MAX_S`.
 
 ## Cơ chế burst (giống saffi)
 

@@ -650,6 +650,9 @@ def main():
         refresh_token(creds)
     elif cmd == "browser-login":
         do_browser_login(creds)
+    elif cmd == "browser-open":
+        import browser_login
+        browser_login.open_interactive(creds["user_agent"])
     elif cmd == "browser-refresh":
         browser_acquire(creds, headless=True)
     elif cmd == "tasks":
@@ -657,7 +660,7 @@ def main():
     elif cmd == "tasks-run":
         do_tasks_scheduled(creds)
     else:
-        sys.exit("Lệnh không hợp lệ. Dùng: test | now | run | status | refresh | browser-login | browser-refresh | tasks | tasks-run")
+        sys.exit("Lệnh không hợp lệ. Dùng: test | now | run | status | refresh | browser-login | browser-open | browser-refresh | tasks | tasks-run")
 
 
 if __name__ == "__main__":
