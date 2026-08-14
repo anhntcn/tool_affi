@@ -172,10 +172,18 @@ def fire_direct_post_via_cdp(fire_offset_ms=-40, burst_count=8, burst_gap_ms=35)
                 if (!signResp.success || !signResp.data || !signResp.data.signatureToken) return {ok:false, err:'signing token fail: '+JSON.stringify(signResp).slice(0,150), log:LOG};
                 const signingToken = signResp.data.signatureToken;
 
-                // ---- Turnstile token ----
+                // ---- Turnstile token (retry: getToken hay timeout "Xác minh bảo mật quá thời gian") ----
                 if (!window.CheckInTurnstile || typeof window.CheckInTurnstile.getToken !== 'function') return {ok:false, err:'CheckInTurnstile not loaded', log:LOG};
-                const tsToken = await window.CheckInTurnstile.getToken();
-                if (!tsToken) return {ok:false, err:'Turnstile getToken empty', log:LOG};
+                function withTimeout(p, ms){ return Promise.race([p, new Promise((_,rej)=>setTimeout(()=>rej(new Error('getToken timeout '+ms+'ms')), ms))]); }
+                let tsToken = null;
+                for (let attempt=0; attempt<4 && !tsToken; attempt++){
+                    try {
+                        if (attempt>0 && window.turnstile && typeof window.turnstile.reset==='function') { try{ window.turnstile.reset(); }catch(e){} }
+                        tsToken = await withTimeout(Promise.resolve(window.CheckInTurnstile.getToken()), 12000);
+                    } catch(e){ log('turnstile attempt '+attempt+' err: '+String(e).slice(0,90)); }
+                    if (!tsToken) await new Promise(r=>setTimeout(r, 700));
+                }
+                if (!tsToken) return {ok:false, err:'Turnstile getToken fail sau 4 lần', log:LOG};
 
                 // ---- import HMAC key 1 lần, dùng lại cho mọi phát ----
                 const encoder = new TextEncoder();
@@ -407,8 +415,16 @@ def cdp_check_logged_in(timeout=25):
 
 
 def kill_chrome():
-    """Kill toàn bộ Chrome (chỉ nếu bạn không dùng Chrome cho việc khác lúc này)."""
-    subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"], capture_output=True)
+    """Kill CHỈ Chrome của profile caffiliate (SeleniumChromeProfile) — KHÔNG đụng Chrome tool khác
+    (saffi/hoantien khác profile) hay Chrome cá nhân. Match theo command line qua WMIC.
+    Trước đây taskkill /IM chrome.exe giết sạch mọi Chrome → mìn với multi-tool; đã bỏ."""
+    marker = os.path.basename(PROFILE_DIR)  # "SeleniumChromeProfile"
+    ps = (
+        "Get-CimInstance Win32_Process -Filter \"name='chrome.exe'\" | "
+        f"Where-Object {{ $_.CommandLine -match '{marker}' }} | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+    )
+    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True)
 
 
 def locate_button():
@@ -621,6 +637,26 @@ def sync_windows_clock():
         return False, f"{type(e).__name__}: {str(e)[:150]}"
 
 
+def fallback_click_after_midnight(deadline_s=90):
+    """Khi fire (direct POST) fail: CHỜ qua midnight rồi reload+click nút THẬT lặp lại tới khi được.
+    Chậm/rank thấp nhưng CỨU STREAK. Turnstile để trang tự xử lý qua widget (không cần getToken tay).
+    Trả (ok, detail)."""
+    now = datetime.now()
+    if now.hour == 23:
+        nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=1, microsecond=0)
+        print(f"[fallback] chờ tới {nxt} rồi click...")
+        precise_wait_until(nxt)
+    deadline = time.time() + deadline_s
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        ok, msg = reload_and_click_via_cdp(max_attempts=20, poll_interval_ms=150)
+        if ok:
+            return True, f"click OK sau {attempt} vòng reload | {msg[:150]}"
+        time.sleep(1)
+    return False, f"hết {deadline_s}s sau {attempt} vòng, nút vẫn không click được"
+
+
 def cmd_run():
     """Production: task scheduler chạy lệnh này ~23:57."""
     print(f"=== RUN MODE ({datetime.now()}) ===")
@@ -643,6 +679,9 @@ def cmd_run():
         print(msg)
         send_telegram(msg)
         return
+
+    # NGÀY MỚI cần điểm danh = hôm nay + 1. Dùng để date-guard verify (chống báo nhầm status ngày cũ).
+    target_date = (now + timedelta(days=1)).date()
 
     # 1. Launch Chrome ngay
     clock_note = f"🕐 clock synced ({sync_detail[:60]})" if sync_ok else f"⚠️ clock sync FAIL ({sync_detail[:80]}) — Task cần quyền admin?"
@@ -700,28 +739,43 @@ def cmd_run():
     if ok:
         send_telegram(f"🖱️ {msg[:500]}")
     else:
-        send_telegram(f"⚠️ Fire fail: {msg[:400]}\nStreak có thể mất, click tay ngay để cứu!")
+        # Fire (direct POST) fail → FALLBACK: chờ qua midnight rồi click nút thật để cứu streak.
+        send_telegram(f"⚠️ Fire fail: {msg[:350]}\n↻ Thử FALLBACK click nút sau midnight...")
+        fb_ok, fb_msg = fallback_click_after_midnight(deadline_s=90)
+        if fb_ok:
+            send_telegram(f"🖱️ FALLBACK OK: {fb_msg}")
+        else:
+            send_telegram(f"❌ FALLBACK fail: {fb_msg}\n‼️ CLICK TAY NGAY để cứu streak!")
 
-    # 6. Chờ 3s cho Chrome xử lý, verify status
+    # 6. Verify — CHỈ tin status khi ĐÃ qua ngày mới (target_date), tránh đọc nhầm status NGÀY CŨ.
     time.sleep(3)
-    now_ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    now2 = datetime.now()
+    now_ts = now2.strftime("%H:%M:%S.%f")[:-3]
+    if now2.date() < target_date:
+        # Chưa qua midnight (fire fail sớm) → status hiện tại là ngày cũ, KHÔNG dùng để kết luận.
+        send_telegram(
+            f"⚠️ Verify SKIP lúc {now_ts}: chưa qua midnight (ngày {target_date} chưa tới). "
+            f"Status lúc này là NGÀY CŨ, không tin được. "
+            + ("Fire báo OK, chờ verify lại sau." if ok else "‼️ CLICK TAY để cứu streak!")
+        )
+        return
     try:
         creds = load_creds_from_file()
         status = get_checkin_status(creds)
         if status and status.get("todayCheckedIn"):
             pos_rank = status.get("todayCheckInPosition")
             streak = status.get("currentStreak")
-            send_telegram(f"✅ Click OK lúc {now_ts} | streak={streak}" + (f" | 🏆 top {pos_rank}" if pos_rank else ""))
+            send_telegram(f"✅ ĐÃ điểm danh NGÀY MỚI ({target_date}) lúc {now_ts} | streak={streak}" + (f" | 🏆 top {pos_rank}" if pos_rank else ""))
         elif status:
-            send_telegram(f"⚠️ Click lúc {now_ts} nhưng status chưa update. Sẽ check lại 30s...")
+            send_telegram(f"⚠️ Chưa thấy checkedIn cho {target_date}. Check lại sau 30s...")
             time.sleep(30)
             status = get_checkin_status(creds)
             if status and status.get("todayCheckedIn"):
-                send_telegram(f"✅ Retry check OK | streak={status.get('currentStreak')} | top {status.get('todayCheckInPosition')}")
+                send_telegram(f"✅ Retry OK ({target_date}) | streak={status.get('currentStreak')} | top {status.get('todayCheckInPosition')}")
             else:
-                send_telegram(f"❌ Sau retry vẫn chưa checkedIn. Có thể click miss hoặc Turnstile chặn.")
+                send_telegram(f"❌ Sau retry vẫn CHƯA điểm danh {target_date}. ‼️ CLICK TAY NGAY để cứu streak!")
         else:
-            send_telegram(f"⚠️ Click lúc {now_ts} nhưng không query được status (cookies?).")
+            send_telegram(f"⚠️ Không query được status (cookies?). Kiểm tra tay cho chắc.")
     except Exception as e:
         send_telegram(f"⚠️ Verify fail: {type(e).__name__}: {str(e)[:200]}")
 
