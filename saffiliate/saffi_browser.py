@@ -343,7 +343,15 @@ def _spawn_chrome(url, port=CDP_PORT):
         raise RuntimeError("Không tìm thấy Google Chrome. Cài Chrome rồi thử lại.")
     args = [
         exe, f"--remote-debugging-port={port}", f"--user-data-dir={CHROME_PROFILE}",
-        "--no-first-run", "--no-default-browser-check", "--start-maximized", url,
+        "--no-first-run", "--no-default-browser-check", "--start-maximized",
+        # QUAN TRỌNG khi MÀN HÌNH KHÓA: Windows đánh dấu cửa sổ "bị che" → Chrome dừng render &
+        # throttle timer → Turnstile invisible không giải xong. Các cờ dưới giữ Chrome chạy full khi
+        # bị che/khóa, để challenge vẫn hoàn tất.
+        "--disable-features=CalculateNativeWinOcclusion",  # đừng coi cửa sổ khóa là "occluded"
+        "--disable-backgrounding-occluded-windows",
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        url,
     ]
     return subprocess.Popen(args)
 
