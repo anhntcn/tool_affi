@@ -28,7 +28,7 @@ ICT_OFFSET_HOURS = 7  # server saffi reset theo 00:00 giờ VN (ICT = UTC+7)
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROFILE_DIR = os.path.join(HERE, ".pw-profile")        # hồ sơ Chromium do Playwright quản (cách cũ)
 CHROME_PROFILE = os.path.join(HERE, ".chrome-profile")  # hồ sơ Chrome THẬT cho chế độ CDP (bền, .gitignore)
-CDP_PORT = 9222
+CDP_PORT = 9223  # RIÊNG cho saffi — caffiliate dùng 9222. Tránh 2 Chrome giành cùng port lúc ~00:00.
 CREDS_PATH = os.path.join(HERE, "creds.json")
 SITE_HOST = "app.saffi.vn"
 QUATANG_URL = f"https://{SITE_HOST}/qua-tang"
