@@ -180,6 +180,15 @@ def _checkin_state(page):
     return "waiting"
 
 
+def _has_text(page, needle):
+    """True nếu innerText trang có chứa `needle` (không phân biệt hoa thường)."""
+    try:
+        txt = (page.evaluate("() => document.body.innerText || ''") or "").lower()
+        return needle.lower() in txt
+    except Exception:
+        return False
+
+
 def _find_checkin_button(page):
     """Trả về locator nút 'Điểm danh ngay' đang hiển thị, hoặc (None, None).
 
@@ -265,6 +274,7 @@ def _wait_and_click(page, captured, deadline_s, log):
     deadline = time.time() + deadline_s
     attempts = 0
     last_reload = time.time()
+    last_hb = 0
     while time.time() < deadline:
         if captured["success"]:
             log("✅ server đã nhận điểm danh.")
@@ -272,9 +282,15 @@ def _wait_and_click(page, captured, deadline_s, log):
         _dismiss_popups(page)
         btn, label = _find_checkin_button(page)  # chỉ khớp 'Điểm danh ngay' (token đã sẵn)
         if btn is None:
+            state = _checkin_state(page)
+            # Heartbeat mỗi ~5s để soi được nó kẹt ở đâu (chờ xác thực / cửa chưa mở / done ngày cũ).
+            if time.time() - last_hb > 5:
+                verifying = _has_text(page, "chờ xác thực")
+                log(f"   … state={state} verifying={verifying} url={page.url[-30:]} rollover={_in_rollover_window()}")
+                last_hb = time.time()
             # 'done' NGOÀI cửa sổ rollover mới tin là đã điểm danh hôm nay. TRONG rollover (00:00–00:09)
             # trang có thể báo "done" cho NGÀY CŨ → phải chờ cửa hôm nay mở, đừng dừng sớm.
-            if _checkin_state(page) == "done" and not _in_rollover_window():
+            if state == "done" and not _in_rollover_window():
                 log("ℹ️ Đã điểm danh hôm nay.")
                 return captured["success"] or {"success": True, "note": "already"}
             page.wait_for_timeout(300)  # poll sát để bấm gần như tức thì khi nút mở / cửa mở
@@ -374,10 +390,17 @@ def checkin_cdp(creds=None, port=CDP_PORT, deadline_s=180, verbose=True, auto_la
 
     creds = creds or _load_creds()
     captured = {"last": None, "success": None}
+    log_path = os.path.join(HERE, "saffi_cdp.log")
 
     def log(m):
+        line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {m}"
         if verbose:
             print(m, flush=True)
+        try:  # luôn ghi ra file để soi được cả khi chạy nền (Task Scheduler)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
 
     proc = None
     if auto_launch:
