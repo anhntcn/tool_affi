@@ -451,6 +451,41 @@ def checkin_cdp(creds=None, port=CDP_PORT, deadline_s=180, verbose=True, auto_la
                 pass
 
 
+def cdp_locktest(port=CDP_PORT, lock_s=22):
+    """Kiểm tra Chrome có bị THROTTLE khi MÀN HÌNH KHÓA không (không cần điểm danh). Mở Chrome, cắm
+    một bộ đếm setInterval 100ms, bảo bạn khóa màn hình ~20s; nếu đếm gần đủ → không throttle →
+    Turnstile sẽ giải được lúc khóa. Nếu đếm ít → vẫn bị throttle → cần xử lý thêm."""
+    from playwright.sync_api import sync_playwright
+
+    proc = _spawn_chrome(QUATANG_URL, port)
+    if not _wait_cdp(port):
+        print("❌ Không mở được CDP.", flush=True)
+        return
+    time.sleep(6)
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = next((pg for pg in ctx.pages if SITE_HOST in pg.url), None)
+            page = page or (ctx.pages[0] if ctx.pages else ctx.new_page())
+            page.evaluate("() => { window.__tick = 0; setInterval(() => { window.__tick++; }, 100); }")
+            print(f"→ HÃY KHÓA MÀN HÌNH (Win+L) NGAY, giữ ~{lock_s}s rồi mở lại…", flush=True)
+            time.sleep(lock_s)
+            tick = page.evaluate("() => window.__tick || 0")
+            ideal = int(lock_s * 10)
+            print(f"Đếm được {tick}/{ideal} nhịp trong ~{lock_s}s.", flush=True)
+            if tick >= ideal * 0.6:
+                print("✅ Timer chạy full khi khóa → Turnstile nhiều khả năng giải được lúc lock.", flush=True)
+            else:
+                print("⚠️ Timer bị throttle khi khóa → Turnstile có thể vẫn kẹt. Báo tôi để xử lý thêm.", flush=True)
+            browser.close()
+    finally:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
 def cdp_login(port=CDP_PORT, wait_s=300):
     """LẦN ĐẦU: mở Chrome thật (hồ sơ .chrome-profile) để bạn đăng nhập saffi. Hồ sơ giữ lại cho các
     lần chạy CDP sau. Chờ tối đa wait_s giây rồi tự đóng (hoặc bạn tự đóng cửa sổ)."""
@@ -662,6 +697,8 @@ if __name__ == "__main__":
         print(json.dumps(res, ensure_ascii=False)[:600] if res else "None")
     elif cmd == "cdp-login":
         cdp_login()
+    elif cmd == "locktest":
+        cdp_locktest()
     elif cmd == "login":
         interactive_login(creds)
     elif cmd == "diag":
