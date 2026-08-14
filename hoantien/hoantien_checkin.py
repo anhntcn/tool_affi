@@ -56,6 +56,9 @@ TASKS_RANDOM_DELAY_MAX_S = 10 * 60  # tối đa 10 phút
 # Endpoint refresh token — ĐÃ XÁC NHẬN hoạt động (server xoay refresh token qua Set-Cookie,
 # code tự lưu lại vào creds.json). Ghi đè bằng creds.json["refresh_url"] nếu sau này site đổi.
 REFRESH_API_URL_DEFAULT = f"https://{API_HOST}/auth/refresh"
+# Đăng nhập cố định bằng email+mật khẩu (không cần Google/trình duyệt) — cách BỀN nhất để tự
+# lấy token mới khi refresh chết. Cũng tính là "đăng nhập thật" nên thỏa mãn nhiệm vụ login_day.
+LOGIN_API_URL_DEFAULT = f"https://{API_HOST}/auth/login"
 
 # Burst trải qua mốc reset (giống saffi) — xem giải thích trong README.
 BURST_LEAD_MS = 500
@@ -216,9 +219,74 @@ def browser_acquire(creds, headless=True):
     return True
 
 
+def password_login(creds, verbose=True):
+    """Đăng nhập bằng email+mật khẩu qua POST /auth/login → token mới + shop_refresh_token.
+
+    Cách BỀN nhất để tự lấy token: không cần Google/OAuth/trình duyệt nên chạy headless lúc
+    màn hình khóa vẫn 100% ăn. Cũng là "đăng nhập thật" nên đánh dấu nhiệm vụ login_day.
+
+    Email/mật khẩu đọc từ .env (HOANTIEN_EMAIL / HOANTIEN_PASSWORD) hoặc creds.json (email/
+    password). Chưa cấu hình → trả False lặng lẽ để caller thử cách khác (trình duyệt)."""
+    email = os.environ.get("HOANTIEN_EMAIL") or creds.get("email")
+    password = os.environ.get("HOANTIEN_PASSWORD") or creds.get("password")
+    if not email or not password:
+        return False
+    url = creds.get("login_url") or LOGIN_API_URL_DEFAULT
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": f"https://{SITE_HOST}",
+        "Referer": f"https://{SITE_HOST}/dang-nhap",
+        "User-Agent": creds["user_agent"],
+    }
+    data = json.dumps({"email": email, "password": password}).encode()
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            body = json.loads(r.read())
+            set_cookie = r.headers.get_all("Set-Cookie") or []
+    except urllib.error.HTTPError as e:
+        if verbose:
+            send_telegram(f"❌ Login email+mật khẩu FAIL: HTTP {e.code}\n{e.read().decode(errors='replace')[:200]}")
+        return False
+    except Exception as e:
+        if verbose:
+            send_telegram(f"❌ Login email+mật khẩu lỗi: {str(e)[:200]}")
+        return False
+
+    # Cập nhật refresh token mới (Set-Cookie) trước — kể cả khi phải refresh để lấy access.
+    for c in set_cookie:
+        if c.startswith("shop_refresh_token="):
+            creds["refresh_token"] = c.split(";", 1)[0].split("=", 1)[1]
+    d = body.get("data", body) if isinstance(body, dict) else {}
+    new_access = d.get("accessToken") or d.get("access_token") or d.get("token") or body.get("accessToken")
+    if new_access:
+        creds["access_token"] = new_access
+        save_creds(creds)
+        if verbose:
+            left = token_seconds_left(creds)
+            send_telegram(f"🔑 Login email+mật khẩu OK — token mới còn ~{int(left) if left else '?'}s")
+        return True
+    # Body không kèm access token nhưng đã có refresh cookie mới → lấy access qua refresh.
+    if any(c.startswith("shop_refresh_token=") for c in set_cookie):
+        save_creds(creds)
+        return refresh_token(creds, verbose=verbose)
+    if verbose:
+        send_telegram(f"⚠️ Login trả về nhưng không có access token / cookie. Keys: {list(d)[:8]}")
+    return False
+
+
+def reacquire_token(creds):
+    """Refresh đã chết → lấy token mới: ưu tiên login email+mật khẩu (bền), fallback OAuth
+    trình duyệt. Trả về True nếu lấy được token dùng được."""
+    if password_login(creds, verbose=True):
+        return True
+    return browser_acquire(creds)
+
+
 def ensure_token(creds):
     """Token còn hạn → dùng luôn. Sắp hết → thử refresh (nhanh). Refresh chết (ver cũ, do bạn
-    vừa đăng nhập web) → tự lấy token mới bằng trình duyệt. Trả về True nếu token dùng được."""
+    vừa đăng nhập web) → tự lấy token mới (login email+mật khẩu, rồi trình duyệt). True nếu ok."""
     left = token_seconds_left(creds)
     if left is None:
         return True  # không đọc được exp → cứ thử dùng
@@ -226,8 +294,7 @@ def ensure_token(creds):
         return True
     if refresh_token(creds, verbose=False):
         return True
-    # Refresh token chết → phiên bị web giành mất. Tự lành bằng trình duyệt.
-    return browser_acquire(creds)
+    return reacquire_token(creds)
 
 
 # ---------- HTTP ----------
@@ -434,8 +501,8 @@ def do_burst(creds, count=None, interval_ms=BURST_INTERVAL_MS):
         return
 
     # Toàn bộ 401 → token chết. Thử refresh nhanh, fail thì tự lấy token mới bằng trình duyệt.
-    if auth_err and not refresh_token(creds, verbose=False) and not browser_acquire(creds):
-        send_telegram("❌ Token chết và không tự lấy lại được — KHÔNG điểm danh được.\nChạy 1 lần: python hoantien_checkin.py browser-login (đăng nhập Google).")
+    if auth_err and not refresh_token(creds, verbose=False) and not reacquire_token(creds):
+        send_telegram("❌ Token chết và không tự lấy lại được — KHÔNG điểm danh được.\nĐặt HOANTIEN_EMAIL/PASSWORD trong .env, hoặc chạy: python hoantien_checkin.py browser-login.")
         return
 
     if recovered_prev:
@@ -457,8 +524,8 @@ def do_burst(creds, count=None, interval_ms=BURST_INTERVAL_MS):
             recovered_prev = True
         if p.get("httpError") == 401:
             auth_streak += 1
-            if auth_streak >= 3 and not refresh_token(creds, verbose=False) and not browser_acquire(creds):
-                send_telegram("❌ Token chết giữa chừng, không tự lấy lại được — dừng. Chạy browser-login.")
+            if auth_streak >= 3 and not refresh_token(creds, verbose=False) and not reacquire_token(creds):
+                send_telegram("❌ Token chết giữa chừng, không tự lấy lại được — dừng. Đặt HOANTIEN_EMAIL/PASSWORD hoặc chạy browser-login.")
                 return
         else:
             auth_streak = 0
@@ -574,13 +641,14 @@ def do_tasks(creds):
     # refresh shop-token KHÔNG tính là "đăng nhập" → nếu không mở trình duyệt, tiến độ mãi 0/1.
     # Vì vậy khi nhiệm vụ này chưa nhận, chủ động đăng nhập lại bằng hồ sơ Playwright rồi refetch.
     if login and login.get("status") != "da_nhan":
-        if browser_acquire(creds):
+        # login_day cần ĐĂNG NHẬP THẬT. Ưu tiên login email+mật khẩu (bền), fallback OAuth trình duyệt.
+        if reacquire_token(creds):
             items = get_tasks(creds) or items
             login = next((it for it in items if it.get("ruleType") == "login_day"), login)
         else:
-            # browser_acquire đã tự báo Telegram (cần chạy browser-login tay). Vẫn thử claim tiếp
+            # Đã tự báo Telegram (cần .env email/pass hoặc browser-login tay). Vẫn thử claim tiếp
             # phòng khi login_day đã được đánh dấu từ lần vào web khác trong ngày.
-            send_telegram("⚠️ Không tự đăng nhập trình duyệt được — login_day có thể chưa đủ tiến độ.")
+            send_telegram("⚠️ Không tự đăng nhập được — login_day có thể chưa đủ tiến độ.")
     todo = claimable_daily(items)
     if not todo:
         note = "đã nhận hôm nay" if (login and login.get("status") == "da_nhan") else "không có nhiệm vụ ngày để claim"

@@ -23,11 +23,31 @@ cơ chế **1 tài khoản = 1 phiên** (không phải chỉ "reuse detection").
 > SAU thì thắng; phiên còn lại chết. **Không thể** vừa chạy tool vừa dùng web song song lâu dài.
 > Mẹo "cửa sổ ẩn danh" KHÔNG cứu được — vì bản chất là server chỉ cho 1 phiên sống.
 
-### ✅ Giải pháp: tool tự đăng nhập lại bằng trình duyệt (Playwright)
+### ✅ Giải pháp A (KHUYẾN NGHỊ): đăng nhập cố định bằng email + mật khẩu
 
-Site đăng nhập bằng **Google/Shopee OAuth** (không có API email+mật khẩu) nên không thể tự "gõ
-mật khẩu". Thay vào đó tool giữ sẵn một **hồ sơ trình duyệt đã đăng nhập Google** (`.pw-profile/`)
-và tự mở lại mỗi khi cần token — xem [browser_login.py](browser_login.py).
+Site **có** API email+mật khẩu (`POST /auth/login`) — bền hơn OAuth Google rất nhiều: không cần
+trình duyệt, chạy headless lúc màn hình khóa vẫn 100% ăn, và **tính là "đăng nhập thật"** nên tự
+thỏa nhiệm vụ `login_day`. Đây là cách nên dùng.
+
+**Cài 1 lần:**
+1. Đặt mật khẩu cho tài khoản: mở https://hoantienshopee.me/quen-mat-khau → nhập email đang dùng
+   (kể cả tài khoản tạo bằng Google) → lấy link trong mail → đặt mật khẩu.
+2. Điền vào `.env` (đã `.gitignore`):
+   ```
+   HOANTIEN_EMAIL=email-cua-ban@gmail.com
+   HOANTIEN_PASSWORD=matkhau-vua-dat
+   ```
+3. Kiểm tra: `python hoantien_checkin.py refresh` (nếu refresh chết nó sẽ tự login lại) hoặc
+   `python hoantien_checkin.py status`.
+
+Sau đó `ensure_token` tự lo: token sắp hết → refresh; refresh chết (do bạn vào web làm nhảy `ver`)
+→ tự `POST /auth/login` lấy token mới. Không cần Google, không cần mở cửa sổ.
+
+### ✅ Giải pháp B (dự phòng): tự đăng nhập lại bằng trình duyệt (Playwright)
+
+Nếu không đặt mật khẩu, tool giữ sẵn một **hồ sơ trình duyệt đã đăng nhập Google** (`.pw-profile/`)
+và tự lái OAuth mỗi khi cần token — xem [browser_login.py](browser_login.py). Kém bền hơn A (Google
+có thể bắt xác minh lại, popup chậm lúc máy tải nặng) nên chỉ dùng khi chưa cấu hình A.
 
 **Cài 1 lần:**
 ```powershell
