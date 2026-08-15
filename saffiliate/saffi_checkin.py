@@ -415,26 +415,49 @@ def do_burst(creds, count=None, interval_ms=BURST_INTERVAL_MS):
     send_telegram(f"❌ Không điểm danh được HÔM NAY sau {POLL_MAX_SECONDS // 60}' / {polls} lần poll{thr}{prev_note}")
 
 
+# Bao lâu chịu poll /status chờ cửa mở, và nhịp poll.
+STATUS_POLL_MAX_S = 3 * 3600   # kiên trì tối đa 3h (bao sai lệch mốc reset)
+STATUS_POLL_GAP_S = 180        # kiểm tra /status mỗi 3 phút
+
+
 def run_scheduled(creds):
-    send_telegram(f"⏳ Phiên điểm danh {datetime.now().strftime('%Y-%m-%d')} — chờ 00:00 ICT")
+    """QUAN TRỌNG: saffi KHÔNG reset điểm danh lúc 00:00 ICT như tưởng trước đây — quan sát cho thấy
+    cửa ngày mới mở muộn (khoảng 07:00 ICT = 00:00 UTC). Thay vì đoán giờ, POLL /status tới khi
+    `checked_in_today=false` (cửa đã mở cho ngày mới) rồi điểm danh qua Chrome (vượt Turnstile).
+    Đặt Task Scheduler chạy quanh 06:45 ICT để không phải thức cả đêm."""
+    send_telegram(f"⏳ Phiên điểm danh {datetime.now().strftime('%Y-%m-%d')} — poll /status chờ cửa mở…")
     try:
         _socket.getaddrinfo(API_HOST, 443)  # warm DNS
     except Exception:
         pass
 
-    # Đo RTT lúc 00:00 - 5s (chỉ để log debug — không còn dùng để bù offset).
-    wait_next_midnight(offset_ms=-5000)
-    samples = [ms for ms in (measure_rtt(creds) for _ in range(3)) if ms is not None]
-    rtt_str = f"{[int(s) for s in samples]}ms" if samples else "n/a"
-    count = max(1, BURST_WINDOW_MS // BURST_INTERVAL_MS)
-    send_telegram(
-        f"📡 RTT {rtt_str} · burst nhẹ {count} phát lúc 00:00, rồi poll mỗi {POLL_GAP_MS // 1000}s "
-        f"tới khi cửa mở (≤{POLL_MAX_SECONDS // 60}')"
-    )
+    deadline = time.time() + STATUS_POLL_MAX_S
+    announced = False
+    fails = 0
+    while time.time() < deadline:
+        st = get_status(creds)
+        if st is None:
+            fails += 1
+            if fails == 3:
+                send_telegram("⚠️ /status lỗi liên tục — token/cookie hết hạn? Vẫn thử lại…")
+            time.sleep(STATUS_POLL_GAP_S)
+            continue
+        fails = 0
+        if not st.get("checked_in_today"):
+            send_telegram("🚪 Cửa điểm danh đã mở — điểm danh qua Chrome thật…")
+            if browser_checkin(creds, "cửa mở"):
+                return
+            time.sleep(STATUS_POLL_GAP_S)  # lỗi tạm → thử lại vòng sau
+            continue
+        if not announced:
+            send_telegram(
+                f"😴 Chưa tới giờ reset (đã điểm danh hôm qua) — poll /status mỗi "
+                f"{STATUS_POLL_GAP_S // 60}' tới khi cửa mở (≤{STATUS_POLL_MAX_S // 3600}h)…"
+            )
+            announced = True
+        time.sleep(STATUS_POLL_GAP_S)
 
-    # Bắt đầu bắn TRƯỚC mốc BURST_LEAD_MS, cửa sổ kéo dài QUA mốc → luôn có phát rơi vào ngày mới.
-    wait_next_midnight(offset_ms=-BURST_LEAD_MS)
-    do_burst(creds)
+    send_telegram(f"❌ Sau {STATUS_POLL_MAX_S // 3600}h vẫn chưa điểm danh được — kiểm tra lại (cửa mở muộn hơn?).")
 
 
 def do_status(creds):

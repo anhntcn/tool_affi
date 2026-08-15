@@ -35,9 +35,9 @@ QUATANG_URL = f"https://{SITE_HOST}/qua-tang"
 LOGIN_URL = f"https://{SITE_HOST}/dang-nhap"
 CHECKIN_PATH = "/api/spoint/checkin"
 
-# Nhãn nút điểm danh — xác nhận từ CheckinHero chunk là "Điểm danh ngay". Vài biến thể phòng hờ.
-# KHÔNG để "Điểm danh" trần (trùng heading "Điểm Danh Nhận S-Point" và text khác trên trang).
-CHECKIN_BTN_TEXTS = ["Điểm danh ngay", "Điểm danh hôm nay"]
+# Nhãn nút điểm danh — CHỈ "Điểm danh ngay" (xác nhận từ CheckinHero). KHÔNG thêm biến thể khác:
+# "Điểm danh hôm nay" trùng chuỗi con của thông báo "Bạn đã ĐIỂM DANH HÔM NAY..." → khớp nhầm.
+CHECKIN_BTN_TEXTS = ["Điểm danh ngay"]
 
 
 class NeedsInteractiveLogin(Exception):
@@ -132,7 +132,10 @@ def _first_clickable(loc, max_n=6):
         try:
             if b.is_visible():
                 label = (b.inner_text() or "").strip()
-                if "lịch sử" in label.lower():
+                low = label.lower()
+                # Bỏ qua các phần tử KHÔNG phải nút điểm danh thật: mục "lịch sử", và nhất là dòng
+                # thông báo "Bạn đã điểm danh hôm nay…" (chứa 'điểm danh' nên dễ khớp nhầm).
+                if "lịch sử" in low or "đã điểm danh" in low or "quay lại" in low:
                     continue
                 return b, label
         except Exception:
