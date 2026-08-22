@@ -460,6 +460,37 @@ def run_scheduled(creds):
     send_telegram(f"❌ Sau {STATUS_POLL_MAX_S // 3600}h vẫn chưa điểm danh được — kiểm tra lại (cửa mở muộn hơn?).")
 
 
+def do_statuswatch(creds, gap_s=60, hours=9):
+    """Ghi /status mỗi `gap_s` giây để TÌM GIỜ RESET: khi `checked_in_today` lật true→false là
+    cửa ngày mới mở. Ghi ra saffi_status_watch.log + báo Telegram đúng khoảnh khắc mở. Chạy qua
+    đêm (giữ máy thức). Ctrl+C để dừng. Sau khi biết giờ reset → chỉnh lịch bắn sát mốc."""
+    path = os.path.join(HERE, "saffi_status_watch.log")
+    end = time.time() + hours * 3600
+    prev = None
+    reset_found = False
+    print(f"[statuswatch] ghi mỗi {gap_s}s trong ≤{hours}h → {path}", flush=True)
+    while time.time() < end:
+        st = get_status(creds)
+        cit = None if st is None else bool(st.get("checked_in_today"))
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{stamp} checked_in_today={cit} streak={(st or {}).get('spoint_streak')}"
+        print(line, flush=True)
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+        if prev is True and cit is False and not reset_found:
+            msg = f"🚪 SAFFI CỬA MỞ (reset) lúc {datetime.now().strftime('%H:%M:%S')} — ghi nhớ mốc này!"
+            send_telegram(msg)
+            reset_found = True
+        if cit is not None:
+            prev = cit
+        time.sleep(gap_s)
+    if not reset_found:
+        send_telegram("⚠️ statuswatch hết giờ mà chưa bắt được lúc cửa mở (reset ngoài khoảng theo dõi?).")
+
+
 def do_status(creds):
     st = get_status(creds)
     if not st:
@@ -494,6 +525,9 @@ def main():
         run_scheduled(creds)
     elif cmd == "status":
         do_status(creds)
+    elif cmd == "statuswatch":
+        gap = int(sys.argv[2]) if len(sys.argv) > 2 else 60
+        do_statuswatch(creds, gap_s=gap)
     elif cmd == "browser":
         browser_checkin(creds, "chạy tay", deadline_s=180)
     elif cmd == "cdp":
@@ -510,7 +544,7 @@ def main():
         import saffi_browser
         saffi_browser.interactive_login(creds)
     else:
-        sys.exit("Lệnh không hợp lệ. Dùng: test | now | run | status | browser | cdp | cdp-login | browser-login")
+        sys.exit("Lệnh không hợp lệ. Dùng: test | now | run | status | statuswatch | browser | cdp | cdp-login | browser-login")
 
 
 if __name__ == "__main__":
