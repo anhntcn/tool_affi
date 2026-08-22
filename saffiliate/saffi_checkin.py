@@ -527,7 +527,8 @@ def main():
         do_status(creds)
     elif cmd == "statuswatch":
         gap = int(sys.argv[2]) if len(sys.argv) > 2 else 60
-        do_statuswatch(creds, gap_s=gap)
+        hrs = int(sys.argv[3]) if len(sys.argv) > 3 else 9
+        do_statuswatch(creds, gap_s=gap, hours=hrs)
     elif cmd == "browser":
         browser_checkin(creds, "chạy tay", deadline_s=180)
     elif cmd == "cdp":
