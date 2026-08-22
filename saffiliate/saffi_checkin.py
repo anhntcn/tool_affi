@@ -460,10 +460,23 @@ def run_scheduled(creds):
     send_telegram(f"❌ Sau {STATUS_POLL_MAX_S // 3600}h vẫn chưa điểm danh được — kiểm tra lại (cửa mở muộn hơn?).")
 
 
-def do_statuswatch(creds, gap_s=60, hours=9):
+def do_statuswatch(creds, gap_s=60, hours=9, wait_until=None):
     """Ghi /status mỗi `gap_s` giây để TÌM GIỜ RESET: khi `checked_in_today` lật true→false là
     cửa ngày mới mở. Ghi ra saffi_status_watch.log + báo Telegram đúng khoảnh khắc mở. Chạy qua
-    đêm (giữ máy thức). Ctrl+C để dừng. Sau khi biết giờ reset → chỉnh lịch bắn sát mốc."""
+    đêm (giữ máy thức). Ctrl+C để dừng. Sau khi biết giờ reset → chỉnh lịch bắn sát mốc.
+
+    wait_until='HH:MM' → chạy lệnh sớm nhưng NGỦ tới giờ đó mới bắt đầu poll (khỏi poll vô ích)."""
+    if wait_until:
+        try:
+            hh, mm = map(int, wait_until.split(":"))
+            now = datetime.now()
+            target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            delay = (target - now).total_seconds()
+            if delay > 0:
+                print(f"[statuswatch] chờ tới {wait_until} rồi mới poll (~{int(delay // 60)} phút nữa)…", flush=True)
+                time.sleep(delay)
+        except Exception as e:
+            print(f"[statuswatch] wait_until lỗi ({e}) — bắt đầu ngay.", flush=True)
     path = os.path.join(HERE, "saffi_status_watch.log")
     end = time.time() + hours * 3600
     prev = None
@@ -528,7 +541,8 @@ def main():
     elif cmd == "statuswatch":
         gap = int(sys.argv[2]) if len(sys.argv) > 2 else 60
         hrs = int(sys.argv[3]) if len(sys.argv) > 3 else 9
-        do_statuswatch(creds, gap_s=gap, hours=hrs)
+        wu = sys.argv[4] if len(sys.argv) > 4 else None  # 'HH:MM' — chờ tới giờ này mới poll
+        do_statuswatch(creds, gap_s=gap, hours=hrs, wait_until=wu)
     elif cmd == "browser":
         browser_checkin(creds, "chạy tay", deadline_s=180)
     elif cmd == "cdp":
