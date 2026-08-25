@@ -416,8 +416,9 @@ def do_burst(creds, count=None, interval_ms=BURST_INTERVAL_MS):
 
 
 # Bao lâu chịu poll /status chờ cửa mở, và nhịp poll.
+# Reset thực đo được ~00:09 ICT (statuswatch 2026-08-22). Poll DÀY để bắt đúng giây mở → giành #1.
 STATUS_POLL_MAX_S = 3 * 3600   # kiên trì tối đa 3h (bao sai lệch mốc reset)
-STATUS_POLL_GAP_S = 180        # kiểm tra /status mỗi 3 phút
+STATUS_POLL_GAP_S = 5          # kiểm tra /status mỗi 5s (bắn sát mốc mở)
 
 
 def run_scheduled(creds):
@@ -430,6 +431,17 @@ def run_scheduled(creds):
         _socket.getaddrinfo(API_HOST, 443)  # warm DNS
     except Exception:
         pass
+
+    # Chống chạy trùng: nếu ĐÃ điểm danh hôm nay và KHÔNG ở quanh mốc reset (00:09) → thoát ngay.
+    # Nhờ vậy task dự phòng buổi sáng (nếu có) không poll vô ích 3h. Khoảng 23:30–00:30 vẫn poll
+    # (đó là lúc chờ cửa lật sang ngày mới).
+    st0 = get_status(creds)
+    if st0 and st0.get("checked_in_today"):
+        h = datetime.now().hour
+        in_reset_window = (h == 23 and datetime.now().minute >= 30) or (h == 0 and datetime.now().minute <= 30)
+        if not in_reset_window:
+            send_telegram("ℹ️ Hôm nay đã điểm danh rồi — bỏ qua phiên này.")
+            return
 
     deadline = time.time() + STATUS_POLL_MAX_S
     announced = False
