@@ -15,6 +15,7 @@ File deps:
 """
 import json
 import os
+import random
 import subprocess
 import sys
 import time
@@ -657,6 +658,130 @@ def fallback_click_after_midnight(deadline_s=90):
     return False, f"hết {deadline_s}s sau {attempt} vòng, nút vẫn không click được"
 
 
+RANK_DATA_PATH = os.path.join(HERE, "rank_data.md")
+
+_RANK_MD_HEADER = (
+    "# Rank data — caffiliate điểm danh\n\n"
+    "`arrival_ms` = mốc server đóng dấu (`history.createdAt`), số ms sau 00:00 ICT — KHÔNG lệ thuộc clock máy.\n"
+    "`position` = rank hôm đó. `mode` = aggressive/coast/historical.\n\n"
+    "| checkInDate | arrival_ms | position | mode | offset_used_ms | coast_delay_ms | streak |\n"
+    "|---|---|---|---|---|---|---|\n"
+)
+
+
+def _arrival_ms_from_history(status, target_date):
+    """Từ history của status, lấy createdAt (server đóng dấu, ms) của ngày target_date →
+    số ms sau 00:00 ICT. Server lưu createdAt dạng UTC; 00:00 ICT = ngày-1 17:00:00Z.
+    Trả int ms hoặc None. Đây là 'giờ đến' CHUẨN SERVER, không lệ thuộc clock máy."""
+    from email.utils import parsedate_to_datetime  # noqa
+    try:
+        hist = status.get("history") or []
+        tgt = str(target_date)
+        entry = next((h for h in hist if h.get("checkInDate") == tgt), None)
+        if not entry or not entry.get("createdAt"):
+            return None
+        ca = entry["createdAt"].replace("Z", "+00:00")
+        created = datetime.fromisoformat(ca)  # tz-aware UTC
+        # 00:00 ICT của checkInDate = (checkInDate) 00:00 +07:00
+        y, m, d = [int(x) for x in tgt.split("-")]
+        ict_midnight = datetime(y, m, d, tzinfo=timezone(timedelta(hours=7)))
+        return int((created - ict_midnight).total_seconds() * 1000)
+    except Exception as e:
+        print(f"[arrival_ms err] {e}")
+        return None
+
+
+def log_rank_datapoint(status, target_date, mode, offset_used, coast_delay):
+    """Ghi 1 hàng bảng Markdown (checkInDate, arrival_ms, position, mode, offset, coast_delay, streak)
+    vào rank_data.md. Tích luỹ mapping giờ-đến ↔ rank qua nhiều đêm để sau này nhường có cơ sở."""
+    try:
+        arrival_ms = _arrival_ms_from_history(status, target_date)
+        pos = status.get("todayCheckInPosition")
+        streak = status.get("currentStreak")
+        new = not os.path.isfile(RANK_DATA_PATH)
+        with open(RANK_DATA_PATH, "a", encoding="utf-8") as f:
+            if new:
+                f.write(_RANK_MD_HEADER)
+            f.write(f"| {target_date} | {arrival_ms} | {pos} | {mode} | {offset_used} | {coast_delay} | {streak} |\n")
+        return arrival_ms, pos
+    except Exception as e:
+        print(f"[log_rank err] {e}")
+        return None, None
+
+
+def stealth_plan(cfg):
+    """Chiến lược: GIỮ #1 (giữ thưởng) + nguỵ trang timing; định kỳ RÒ BIÊN #2-3 bằng bước nhỏ.
+    Thưởng: top1 > top2=top3 > (top4+=0). Không có băng #2-3 êm (lao vào đám đông ~sau 490ms →
+    khuếch đại → #7 mất trắng), nên nhường phải dò CỰC cẩn thận.
+
+    Mỗi đêm thường: #1 an toàn, offset jitter lệch âm (giờ-đến trải, đỡ vân tay), trần +20ms.
+    Mỗi `stealth_probe_every_nights` đêm: 1 đêm PROBE — nhích offset lên từng bước nhỏ để tìm biên
+    #1→#2-3, đọc rank thật rồi tự điều chỉnh (xem stealth_update). Ngừng probe khi 'found' đã ổn
+    hoặc 'cliff' (không có băng #2-3).
+    Trả (fire_offset_ms, burst_count, burst_gap_ms, mode, note)."""
+    if not cfg.get("stealth_enabled", True):
+        return cfg.get("fire_offset_ms", -40), cfg.get("burst_count", 8), cfg.get("burst_gap_ms", 35), "off", "stealth OFF"
+
+    jitter = cfg.get("stealth_jitter_ms", 120)
+    consec = cfg.get("stealth_consec_top1", 0)
+
+    # --- Đêm PROBE? Lịch NGẪU NHIÊN (gap 3/4/5 đêm, không cố định chu kỳ → giống người) ---
+    probe_on = cfg.get("stealth_probe_enabled", False) and cfg.get("stealth_probe_status", "probing") != "cliff"
+    countdown = cfg.get("stealth_probe_countdown", 3)
+    if probe_on and countdown <= 1:
+        off = int(cfg.get("stealth_probe_offset_ms", 0))
+        off = max(-400, min(off, 500))   # CAP CỨNG: không bao giờ nhảy sâu vào đám đông (đêm #7 là +520)
+        bc = cfg.get("stealth_burst_coast", 3)
+        gap = random.randint(130, 230)
+        st = cfg.get("stealth_probe_status", "probing")
+        return off, int(bc), int(gap), "probe", f"probe off={off}ms step={cfg.get('stealth_probe_step_ms', 30)} status={st}"
+
+    # --- Đêm thường: #1 an toàn + jitter lệch âm ---
+    base = -40
+    bc = cfg.get("stealth_burst_top1", 4)
+    gap = random.randint(40, 90)             # giãn kiểu người retry, đỡ lộ burst
+    off = base + random.randint(-jitter, jitter // 4)
+    off = max(-400, min(off, 20))            # trần +20ms → không chạm crowd
+    return int(off), int(bc), int(gap), "aggressive", f"aggressive off={int(off)}ms burst {bc}×~{gap}ms consec1={consec}"
+
+
+def stealth_update(cfg, rank, mode, offset_used):
+    """Sau khi biết rank thật: đếm đêm (cho lịch probe) + học biên probe (staircase an toàn)."""
+    if mode == "off":
+        return
+    if rank is None:
+        save_config(cfg)   # đêm lỗi: không đụng lịch/biên, giữ nguyên để đêm sau thử lại
+        return
+    cfg["stealth_consec_top1"] = (cfg.get("stealth_consec_top1", 0) + 1) if rank == 1 else 0
+
+    if mode == "probe":
+        step = cfg.get("stealth_probe_step_ms", 30)
+        safe = cfg.get("stealth_probe_safe_offset_ms", -40)
+        if rank == 1:
+            # vẫn trước đám đông → an toàn, ghi mốc, nhích thêm bước nhỏ
+            cfg["stealth_probe_safe_offset_ms"] = int(offset_used)
+            cfg["stealth_probe_offset_ms"] = int(offset_used) + step
+            cfg["stealth_probe_status"] = "probing"
+        elif rank in (2, 3):
+            # TÌM THẤY biên #2-3 → khoá offset này để tái dùng cho đêm nhường
+            cfg["stealth_probe_status"] = "found"
+            cfg["stealth_probe_offset_ms"] = int(offset_used)
+            cfg["stealth_coast_delay_ms"] = int(offset_used)
+        else:  # rank >= 4: nhảy quá biên (khuếch đại) → LÙI về dưới mốc an toàn + giảm nửa bước
+            newstep = max(10, step // 2)
+            cfg["stealth_probe_step_ms"] = newstep
+            cfg["stealth_probe_offset_ms"] = int(safe) + newstep
+            if step <= 10:
+                # bước đã nhỏ mà vẫn 1→≥4 (bỏ qua #2-3) → VÁCH ĐÁ, không có băng #2-3 → ngừng nhường
+                cfg["stealth_probe_status"] = "cliff"
+        # đặt lịch đêm nhường KẾ TIẾP ngẫu nhiên (gap 3/4/5), không cố định
+        cfg["stealth_probe_countdown"] = random.choice(cfg.get("stealth_probe_gap_choices", [2, 3, 4]))
+    else:
+        # đêm thường #1 → đếm ngược tới đêm nhường kế
+        cfg["stealth_probe_countdown"] = max(1, cfg.get("stealth_probe_countdown", 3) - 1)
+    save_config(cfg)
+
+
 def cmd_run():
     """Production: task scheduler chạy lệnh này ~23:57."""
     print(f"=== RUN MODE ({datetime.now()}) ===")
@@ -731,10 +856,9 @@ def cmd_run():
     #    - BURST nhiều POST canh ĐẾN server quanh 00:00:00 server + fire_offset_ms
     #    → không lệ thuộc clock máy; chịu được jitter; log offset/RTT/pos để tinh chỉnh.
     # fire_offset_ms ở đây = arrival của phát ĐẦU so với midnight server (âm = trước, để phát sau bắt boundary).
-    fire_offset_ms = cfg.get("fire_offset_ms", -40)
-    burst_count = cfg.get("burst_count", 8)
-    burst_gap_ms = cfg.get("burst_gap_ms", 35)
-    send_telegram(f"🚀 Inject fire JS. Calibrate+burst {burst_count} phát, arrival phát đầu = midnight{fire_offset_ms:+d}ms server, gap {burst_gap_ms}ms.")
+    fire_offset_ms, burst_count, burst_gap_ms, stealth_mode, stealth_note = stealth_plan(cfg)
+    mode_icon = "🎯" if stealth_mode == "aggressive" else ("🕶️" if stealth_mode == "coast" else "🚀")
+    send_telegram(f"{mode_icon} Fire [{stealth_note}]. arrival phát đầu = midnight{fire_offset_ms:+d}ms server.")
     ok, msg = fire_direct_post_via_cdp(fire_offset_ms=fire_offset_ms, burst_count=burst_count, burst_gap_ms=burst_gap_ms)
     if ok:
         send_telegram(f"🖱️ {msg[:500]}")
@@ -759,25 +883,50 @@ def cmd_run():
             + ("Fire báo OK, chờ verify lại sau." if ok else "‼️ CLICK TAY để cứu streak!")
         )
         return
+    actual_rank = None
+    status = None
     try:
         creds = load_creds_from_file()
         status = get_checkin_status(creds)
         if status and status.get("todayCheckedIn"):
-            pos_rank = status.get("todayCheckInPosition")
+            actual_rank = status.get("todayCheckInPosition")
             streak = status.get("currentStreak")
-            send_telegram(f"✅ ĐÃ điểm danh NGÀY MỚI ({target_date}) lúc {now_ts} | streak={streak}" + (f" | 🏆 top {pos_rank}" if pos_rank else ""))
+            send_telegram(f"✅ ĐÃ điểm danh NGÀY MỚI ({target_date}) lúc {now_ts} | streak={streak}" + (f" | 🏆 top {actual_rank}" if actual_rank else ""))
         elif status:
             send_telegram(f"⚠️ Chưa thấy checkedIn cho {target_date}. Check lại sau 30s...")
             time.sleep(30)
             status = get_checkin_status(creds)
             if status and status.get("todayCheckedIn"):
-                send_telegram(f"✅ Retry OK ({target_date}) | streak={status.get('currentStreak')} | top {status.get('todayCheckInPosition')}")
+                actual_rank = status.get("todayCheckInPosition")
+                send_telegram(f"✅ Retry OK ({target_date}) | streak={status.get('currentStreak')} | top {actual_rank}")
             else:
                 send_telegram(f"❌ Sau retry vẫn CHƯA điểm danh {target_date}. ‼️ CLICK TAY NGAY để cứu streak!")
         else:
             send_telegram(f"⚠️ Không query được status (cookies?). Kiểm tra tay cho chắc.")
     except Exception as e:
         send_telegram(f"⚠️ Verify fail: {type(e).__name__}: {str(e)[:200]}")
+
+    # Ghi datapoint mapping (giờ-đến chuẩn server ↔ rank) + học stealth cho đêm sau.
+    try:
+        prev_coast = cfg.get("stealth_coast_delay_ms", 0)
+        arrival_ms = None
+        if status:
+            arrival_ms, _ = log_rank_datapoint(status, target_date, stealth_mode, fire_offset_ms, prev_coast)
+        stealth_update(cfg, actual_rank, stealth_mode, fire_offset_ms)
+        if actual_rank is not None:
+            warn = " ⚠️RỚT TOP3(0 thưởng)!" if actual_rank >= 4 else ""
+            extra = ""
+            if stealth_mode == "probe":
+                extra = (f" | 🔎 probe status={cfg.get('stealth_probe_status')} "
+                         f"next_off={cfg.get('stealth_probe_offset_ms')}ms step={cfg.get('stealth_probe_step_ms')} "
+                         f"safe_off={cfg.get('stealth_probe_safe_offset_ms')}ms | đêm nhường kế sau {cfg.get('stealth_probe_countdown')} đêm")
+            send_telegram(
+                f"🎚️ stealth: mode={stealth_mode} rank={actual_rank}{warn} | "
+                f"arrival={arrival_ms}ms (server) | offset_dùng={fire_offset_ms}ms | "
+                f"consec1={cfg.get('stealth_consec_top1')}{extra} | 📊 rank_data.md"
+            )
+    except Exception as e:
+        print(f"[stealth_update/log err] {e}")
 
 
 def cmd_test_cdp():
