@@ -39,6 +39,9 @@ CHECKIN_PATH = "/api/spoint/checkin"
 # "Điểm danh hôm nay" trùng chuỗi con của thông báo "Bạn đã ĐIỂM DANH HÔM NAY..." → khớp nhầm.
 CHECKIN_BTN_TEXTS = ["Điểm danh ngay"]
 
+# Server từ chối (403/500…) ngần này lần thì DỪNG — tránh bấm hàng nghìn lần gây flag tài khoản.
+MAX_CHECKIN_ERRORS = 6
+
 
 class NeedsInteractiveLogin(Exception):
     """Trang bị đá về /login → phiên hết hạn, cần chạy `login` mở tay đăng nhập lại."""
@@ -265,6 +268,9 @@ def _attach_capture(page, captured, target=None):
                         captured["success"] = body
                     else:
                         captured["recovered_prev"] = True
+                else:
+                    # Lỗi khác (403/500/…): đếm để DỪNG SỚM, tránh bấm hàng nghìn lần → bị flag acc.
+                    captured["errors"] = captured.get("errors", 0) + 1
         except Exception:
             pass
     page.on("response", on_response)
@@ -315,6 +321,10 @@ def _wait_and_click(page, captured, deadline_s, log):
         while waited < 8 and not captured["success"]:
             page.wait_for_timeout(300)
             waited += 0.3
+        # AN TOÀN: server từ chối liên tục (403…) → DỪNG, không hammer nghìn lần (dễ bị flag acc).
+        if captured.get("errors", 0) >= MAX_CHECKIN_ERRORS:
+            log(f"⛔ Dừng sớm: server từ chối {captured['errors']} lần liên tiếp (resp cuối: {str(captured.get('last'))[:120]}).")
+            break
     # Hết deadline: ưu tiên success hôm nay; nếu chỉ vớt được ngày cũ → báo rõ CHƯA xong hôm nay.
     if captured["success"]:
         return captured["success"]
@@ -445,6 +455,22 @@ def checkin_cdp(creds=None, port=CDP_PORT, deadline_s=180, verbose=True, auto_la
                         "Chạy 1 lần: python saffi_checkin.py cdp-login"
                     )
                 log("→ tự nạp phiên OK.")
+
+            # QUAN TRỌNG: phiên hồ sơ .chrome-profile có thể HẾT HẠN dù trang vẫn tải (không bị đá
+            # /dang-nhap) → POST checkin dùng token cũ trả 403/401. Vì vậy LUÔN nạp bearer hợp lệ từ
+            # creds.json vào localStorage['token'] rồi reload để SPA dùng token đúng.
+            if creds.get("bearer_token"):
+                try:
+                    page.evaluate(
+                        "(t) => { try { localStorage.setItem('token', t); } catch(e){} }",
+                        creds["bearer_token"],
+                    )
+                    _seed_cookies(ctx, creds)
+                    page.reload(wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(2500)
+                    log("→ đã nạp bearer creds.json vào trình duyệt.")
+                except Exception as e:
+                    log(f"   (nạp bearer lỗi: {str(e)[:80]})")
             return _wait_and_click(page, captured, deadline_s, log)
     finally:
         if proc and not keep_open:

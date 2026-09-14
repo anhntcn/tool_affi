@@ -258,6 +258,13 @@ def browser_checkin(creds, note="", deadline_s=POLL_MAX_SECONDS):
     if payload and already_checked(payload):
         send_telegram("ℹ️ (trình duyệt) Hôm nay đã điểm danh rồi.")
         return True
+    # 403 "Đã xảy ra lỗi" = phiên trình duyệt hết hạn / bị chặn → không hammer, báo cần re-login.
+    if payload and payload.get("httpError") == 403:
+        send_telegram(
+            "🔐 Checkin bị 403 (phiên Chrome hết hạn hoặc bị chặn). KHÔNG hammer tiếp.\n"
+            "→ Đăng nhập lại 1 lần: python saffi_checkin.py cdp-login rồi thử: python saffi_checkin.py cdp"
+        )
+        return False
     send_telegram(f"❌ Điểm danh qua trình duyệt CHƯA được. resp: {str(payload)[:160]}")
     return False
 
@@ -419,6 +426,7 @@ def do_burst(creds, count=None, interval_ms=BURST_INTERVAL_MS):
 # Reset thực đo được ~00:09 ICT (statuswatch 2026-08-22). Poll DÀY để bắt đúng giây mở → giành #1.
 STATUS_POLL_MAX_S = 3 * 3600   # kiên trì tối đa 3h (bao sai lệch mốc reset)
 STATUS_POLL_GAP_S = 5          # kiểm tra /status mỗi 5s (bắn sát mốc mở)
+MAX_BROWSER_FAILS = 3          # điểm danh qua Chrome thất bại ngần này lần → dừng (tránh flag acc)
 
 
 def run_scheduled(creds):
@@ -446,6 +454,7 @@ def run_scheduled(creds):
     deadline = time.time() + STATUS_POLL_MAX_S
     announced = False
     fails = 0
+    browser_fails = 0
     while time.time() < deadline:
         st = get_status(creds)
         if st is None:
@@ -459,7 +468,16 @@ def run_scheduled(creds):
             send_telegram("🚪 Cửa điểm danh đã mở — điểm danh qua Chrome thật…")
             if browser_checkin(creds, "cửa mở"):
                 return
-            time.sleep(STATUS_POLL_GAP_S)  # lỗi tạm → thử lại vòng sau
+            # AN TOÀN: điểm danh qua Chrome thất bại nhiều lần (vd server 403) → DỪNG hẳn, KHÔNG
+            # relaunch Chrome + bấm mãi cả đêm (dễ bị flag tài khoản). Báo để xử lý tay.
+            browser_fails += 1
+            if browser_fails >= MAX_BROWSER_FAILS:
+                send_telegram(
+                    f"⛔ DỪNG: điểm danh thất bại {browser_fails} lần (server từ chối?). "
+                    "Không hammer nữa để tránh bị flag. Kiểm tra tay: python saffi_checkin.py cdp"
+                )
+                return
+            time.sleep(60)  # lỗi → nghỉ 60s rồi mới thử lại (giãn nhịp, tránh dồn dập)
             continue
         if not announced:
             send_telegram(
