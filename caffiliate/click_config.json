@@ -5,11 +5,11 @@
   "stealth_enabled": true,
   "stealth_top1_prob": 1.0,
   "stealth_max_consec_top1": 3,
-  "stealth_consec_top1": 8,
-  "stealth_coast_delay_ms": -40,
+  "stealth_consec_top1": 3,
+  "stealth_coast_delay_ms": 30,
   "stealth_force_mode_once": "",
   "stealth_jitter_ms": 120,
-  "stealth_burst_top1": 4,
+  "stealth_burst_top1": 7,
   "stealth_burst_coast": 3,
   "button_x": 1230,
   "button_y": 348,
@@ -20,7 +20,7 @@
     46
   ],
   "chrome_window_size": "1920,1080",
-  "stealth_probe_enabled": true,
+  "stealth_probe_enabled": false,
   "stealth_probe_offset_ms": 60,
   "stealth_probe_step_ms": 30,
   "stealth_probe_safe_offset_ms": 30,
@@ -30,5 +30,13 @@
     3,
     4
   ],
-  "stealth_probe_countdown": 3
+  "stealth_probe_countdown": 1,
+  "cede_enabled": true,
+  "cede_gap_choices": [
+    3,
+    4,
+    5
+  ],
+  "cede_countdown": 5,
+  "cede_date": "2026-09-21"
 }

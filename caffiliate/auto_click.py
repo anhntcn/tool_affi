@@ -133,7 +133,7 @@ def click_via_cdp(button_id="btnCheckIn"):
         return False, f"{type(e).__name__}: {str(e)[:200]}"
 
 
-def fire_direct_post_via_cdp(fire_offset_ms=-40, burst_count=8, burst_gap_ms=35):
+def fire_direct_post_via_cdp(fire_offset_ms=-40, burst_count=8, burst_gap_ms=35, pre_token=None):
     """PRE-FETCH tokens TRƯỚC midnight, calibrate giờ SERVER, warm connection, rồi BURST POST.
 
     Cải tiến so với bản 1-phát:
@@ -173,18 +173,23 @@ def fire_direct_post_via_cdp(fire_offset_ms=-40, burst_count=8, burst_gap_ms=35)
                 if (!signResp.success || !signResp.data || !signResp.data.signatureToken) return {ok:false, err:'signing token fail: '+JSON.stringify(signResp).slice(0,150), log:LOG};
                 const signingToken = signResp.data.signatureToken;
 
-                // ---- Turnstile token (retry: getToken hay timeout "Xác minh bảo mật quá thời gian") ----
-                if (!window.CheckInTurnstile || typeof window.CheckInTurnstile.getToken !== 'function') return {ok:false, err:'CheckInTurnstile not loaded', log:LOG};
-                function withTimeout(p, ms){ return Promise.race([p, new Promise((_,rej)=>setTimeout(()=>rej(new Error('getToken timeout '+ms+'ms')), ms))]); }
-                let tsToken = null;
-                for (let attempt=0; attempt<4 && !tsToken; attempt++){
-                    try {
-                        if (attempt>0 && window.turnstile && typeof window.turnstile.reset==='function') { try{ window.turnstile.reset(); }catch(e){} }
-                        tsToken = await withTimeout(Promise.resolve(window.CheckInTurnstile.getToken()), 12000);
-                    } catch(e){ log('turnstile attempt '+attempt+' err: '+String(e).slice(0,90)); }
-                    if (!tsToken) await new Promise(r=>setTimeout(r, 700));
+                // ---- Turnstile token: ƯU TIÊN pre-token (warm-up lấy sẵn TRƯỚC fire, TTL ~5min),
+                //      fallback getToken tại chỗ (retry) nếu không có/pre-token rỗng.
+                //      Nguyên nhân #11 (27/08): getToken kẹt 'Đang xác minh' lúc fire → nay warm-up trước. ----
+                let tsToken = __PRE_TOKEN__;
+                if (tsToken) { log('dùng pre-token warm-up'); }
+                if (!tsToken) {
+                    if (!window.CheckInTurnstile || typeof window.CheckInTurnstile.getToken !== 'function') return {ok:false, err:'CheckInTurnstile not loaded', log:LOG};
+                    function withTimeout(p, ms){ return Promise.race([p, new Promise((_,rej)=>setTimeout(()=>rej(new Error('getToken timeout '+ms+'ms')), ms))]); }
+                    for (let attempt=0; attempt<4 && !tsToken; attempt++){
+                        try {
+                            if (attempt>0 && window.turnstile && typeof window.turnstile.reset==='function') { try{ window.turnstile.reset(); }catch(e){} }
+                            tsToken = await withTimeout(Promise.resolve(window.CheckInTurnstile.getToken()), 12000);
+                        } catch(e){ log('turnstile attempt '+attempt+' err: '+String(e).slice(0,90)); }
+                        if (!tsToken) await new Promise(r=>setTimeout(r, 700));
+                    }
                 }
-                if (!tsToken) return {ok:false, err:'Turnstile getToken fail sau 4 lần', log:LOG};
+                if (!tsToken) return {ok:false, err:'Turnstile getToken fail (không có pre-token + getToken fail 4 lần)', log:LOG};
 
                 // ---- import HMAC key 1 lần, dùng lại cho mọi phát ----
                 const encoder = new TextEncoder();
@@ -307,7 +312,8 @@ def fire_direct_post_via_cdp(fire_offset_ms=-40, burst_count=8, burst_gap_ms=35)
         })()
         """.replace("__FIRE_OFFSET__", str(int(fire_offset_ms))) \
            .replace("__BURST_N__", str(int(burst_count))) \
-           .replace("__BURST_GAP__", str(int(burst_gap_ms)))
+           .replace("__BURST_GAP__", str(int(burst_gap_ms))) \
+           .replace("__PRE_TOKEN__", json.dumps(pre_token) if pre_token else "null")
 
         # JS block cho tới sau midnight. Từ 23:57 tới fire = ~183s + burst.
         ws.send(json.dumps({
@@ -709,6 +715,53 @@ def log_rank_datapoint(status, target_date, mode, offset_used, coast_delay):
         return None, None
 
 
+def ensure_turnstile_ready(deadline_dt, max_reloads=3):
+    """Warm-up Turnstile TRƯỚC fire → lấy sẵn token (TTL ~5min, dùng được lúc 00:00).
+    getToken hay kẹt 'Đang xác minh bảo mật' nếu widget chưa init xong/stuck (nguyên nhân #11 đêm 27/08).
+    Thử getToken; nếu fail thì RELOAD trang cho widget init lại; lặp tới khi có token hoặc hết deadline.
+    Trả (ok, token|None, detail)."""
+    get_js = (
+        "(async function(){try{"
+        "if(!window.CheckInTurnstile||typeof window.CheckInTurnstile.getToken!=='function')return{ok:false,err:'not loaded'};"
+        "var t=await Promise.race(["
+        "Promise.resolve(window.CheckInTurnstile.getToken()),"
+        "new Promise(function(_,r){setTimeout(function(){r(new Error('timeout'))},10000)})"
+        "]);"
+        "return{ok:!!t,token:t||'',err:t?'':'empty'};"
+        "}catch(e){return{ok:false,err:String(e).slice(0,90)};}})()"
+    )
+    reloads = 0
+    last_err = ""
+    while datetime.now() < deadline_dt:
+        try:
+            ws = _cdp_get_ws()
+            ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
+                                "params": {"expression": get_js, "awaitPromise": True,
+                                           "returnByValue": True, "timeout": 12000}}))
+            ws.settimeout(15)
+            res = json.loads(ws.recv())
+            ws.close()
+            val = res.get("result", {}).get("result", {}).get("value", {})
+            if val.get("ok") and val.get("token"):
+                return True, val.get("token"), f"ready sau {reloads} reload"
+            last_err = val.get("err", "?")
+        except Exception as e:
+            last_err = f"{type(e).__name__}"
+        # chưa ready → reload cho widget init lại (còn quota reload + còn đủ thời gian)
+        if reloads < max_reloads and datetime.now() < deadline_dt - timedelta(seconds=25):
+            try:
+                ws = _cdp_get_ws()
+                _cdp_send(ws, "Page.reload", msg_id=1)
+                ws.close()
+            except Exception:
+                pass
+            reloads += 1
+            time.sleep(18)  # chờ page + Turnstile init lại
+        else:
+            time.sleep(5)
+    return False, None, f"chưa ready (sau {reloads} reload, last_err={last_err})"
+
+
 def stealth_plan(cfg):
     """Chiến lược: GIỮ #1 (giữ thưởng) + nguỵ trang timing; định kỳ RÒ BIÊN #2-3 bằng bước nhỏ.
     Thưởng: top1 > top2=top3 > (top4+=0). Không có băng #2-3 êm (lao vào đám đông ~sau 490ms →
@@ -736,12 +789,15 @@ def stealth_plan(cfg):
         st = cfg.get("stealth_probe_status", "probing")
         return off, int(bc), int(gap), "probe", f"probe off={off}ms step={cfg.get('stealth_probe_step_ms', 30)} status={st}"
 
-    # --- Đêm thường: #1 an toàn + jitter lệch âm ---
+    # --- Đêm thường: #1 an toàn + jitter cho timing đa dạng ---
+    # QUAN TRỌNG: đủ phát để LUÔN có phát rơi SAU giờ server mở, dù offset âm. Nếu không, cả burst
+    # rơi trước giờ mở → fire fail → fallback (commit muộn ~8s) → rớt hạng (bug đêm 27/08: off=-146 → #11).
     base = -40
-    bc = cfg.get("stealth_burst_top1", 4)
-    gap = random.randint(40, 90)             # giãn kiểu người retry, đỡ lộ burst
-    off = base + random.randint(-jitter, jitter // 4)
-    off = max(-400, min(off, 20))            # trần +20ms → không chạm crowd
+    bc = cfg.get("stealth_burst_top1", 7)     # 7 phát: span đủ rộng phủ qua giờ mở
+    gap = random.randint(50, 80)
+    # offset âm cho timing đa dạng, nhưng CLAMP [-140,+10] để burst 7 phát luôn chạm cửa mở
+    off = base + random.randint(-90, 20)
+    off = max(-140, min(off, 10))
     return int(off), int(bc), int(gap), "aggressive", f"aggressive off={int(off)}ms burst {bc}×~{gap}ms consec1={consec}"
 
 
@@ -808,6 +864,51 @@ def cmd_run():
     # NGÀY MỚI cần điểm danh = hôm nay + 1. Dùng để date-guard verify (chống báo nhầm status ngày cũ).
     target_date = (now + timedelta(days=1)).date()
 
+    # LƯỚI CỨU CHÓT (23:57 — run này CHẮC CHẮN chạy): HÔM NAY đã điểm danh chưa?
+    # Nếu CHƯA → streak sắp mất lúc 23:59 (vd đêm nhường mà keepalive 20:00 lỗi/không chạy, hoặc midnight
+    # đêm qua lỗi mà keepalive cũng miss). Cứu KHẨN CẤP ngay + báo động (còn ~2 phút).
+    try:
+        creds0 = load_creds_from_file()
+        st0 = get_checkin_status(creds0)
+        if st0 is not None and not st0.get("todayCheckedIn"):
+            send_telegram(
+                f"🚨 CHƯA điểm danh HÔM NAY ({now.date()}) lúc {now.strftime('%H:%M')}! "
+                f"Streak sắp MẤT lúc 23:59 — cứu khẩn cấp..."
+            )
+            launch_chrome()
+            time.sleep(18)
+            okE, msgE = reload_and_click_via_cdp(max_attempts=30, poll_interval_ms=200)
+            time.sleep(4)
+            stE = get_checkin_status(creds0)
+            if stE and stE.get("todayCheckedIn"):
+                send_telegram(f"🛟 Cứu chót OK — đã điểm danh {now.date()} | streak={stE.get('currentStreak')} | rank={stE.get('todayCheckInPosition')}")
+            else:
+                send_telegram(
+                    f"🔴🔴 CỨU CHÓT FAIL ({msgE[:120]})\n"
+                    f"‼️‼️ CLICK TAY NGAY (còn ~2 phút tới 23:59) để cứu streak {now.date()}!"
+                )
+    except Exception as e:
+        print(f"[last-ditch err] {e}")
+
+    # ĐÊM NHƯỜNG? Nếu có → KHÔNG bắn 00:00. Ghi cờ cede_date; session_keepalive (20:00-20:10) sẽ điểm
+    # danh ban ngày (rank thấp → mất thưởng đêm nay nhưng GIỮ streak, phá pattern 'luôn #1 lúc 00:00').
+    # Cadence ngẫu nhiên (gap 3/4/5 đêm) để không cố định. Sân đã vắng nên đây là cách nhường DUY NHẤT
+    # đáng tin: nhường bằng cách điểm danh muộn hẳn, thay vì cố nhắm #2-3 (bất khả thi khi ít đối thủ).
+    if cfg.get("cede_enabled", False):
+        cede_cd = cfg.get("cede_countdown", 3)
+        if cede_cd <= 1:
+            cfg["cede_date"] = str(target_date)
+            cfg["cede_countdown"] = random.choice(cfg.get("cede_gap_choices", [3, 4, 5]))
+            save_config(cfg)
+            send_telegram(
+                f"🌙 Đêm NHƯỜNG ({target_date}): BỎ QUA bắn 00:00.\n"
+                f"Keepalive sẽ điểm danh ~20:00-20:10 (rank thấp/không thưởng đêm nay, GIỮ streak).\n"
+                f"Đêm nhường kế: sau {cfg['cede_countdown']} đêm."
+            )
+            return
+        cfg["cede_countdown"] = max(1, cede_cd - 1)
+        save_config(cfg)
+
     # 1. Launch Chrome ngay
     clock_note = f"🕐 clock synced ({sync_detail[:60]})" if sync_ok else f"⚠️ clock sync FAIL ({sync_detail[:80]}) — Task cần quyền admin?"
     skew_note = f"🚨 CAFFI SKEW GIỜ: {skew_detail}" if skewed else f"🧭 skew check OK: {skew_detail}"
@@ -849,8 +950,16 @@ def cmd_run():
     else:
         send_telegram(f"📍 Locked nút (screen match) tại {pos}. Chờ tới midnight{offset_ms:+d}ms...")
 
+    # 3b. WARM-UP TURNSTILE — lấy sẵn token TRƯỚC fire (reload nếu widget kẹt 'Đang xác minh').
+    #     Nguyên nhân #11 đêm 27/08: getToken kẹt lúc fire → abort → fallback muộn → rank 11.
+    #     Deadline ~23:59:15 để còn kịp fire calibration (bắt đầu ~23:59:51).
+    ts_deadline = now.replace(hour=23, minute=59, second=15, microsecond=0)
+    ts_ok, pre_token, ts_detail = ensure_turnstile_ready(ts_deadline)
+    send_telegram(f"{'🟢' if ts_ok else '🟠'} Turnstile warm-up: {ts_detail}"
+                  + ("" if ts_ok else " — fire sẽ tự thử getToken + fallback"))
+
     # 4. FIRE approach: inject JS vào Chrome. JS sẽ:
-    #    - Extract creds + fetch signing/Turnstile token TRƯỚC midnight
+    #    - Extract creds + fetch signing token; DÙNG pre-token warm-up (fallback getToken nếu thiếu)
     #    - CALIBRATE giờ server (edge-detection header Date) → offset + RTT
     #    - Warm connection ~1.5s trước fire
     #    - BURST nhiều POST canh ĐẾN server quanh 00:00:00 server + fire_offset_ms
@@ -859,7 +968,7 @@ def cmd_run():
     fire_offset_ms, burst_count, burst_gap_ms, stealth_mode, stealth_note = stealth_plan(cfg)
     mode_icon = "🎯" if stealth_mode == "aggressive" else ("🕶️" if stealth_mode == "coast" else "🚀")
     send_telegram(f"{mode_icon} Fire [{stealth_note}]. arrival phát đầu = midnight{fire_offset_ms:+d}ms server.")
-    ok, msg = fire_direct_post_via_cdp(fire_offset_ms=fire_offset_ms, burst_count=burst_count, burst_gap_ms=burst_gap_ms)
+    ok, msg = fire_direct_post_via_cdp(fire_offset_ms=fire_offset_ms, burst_count=burst_count, burst_gap_ms=burst_gap_ms, pre_token=pre_token)
     if ok:
         send_telegram(f"🖱️ {msg[:500]}")
     else:
