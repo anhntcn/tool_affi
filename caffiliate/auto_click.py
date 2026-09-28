@@ -159,6 +159,8 @@ def fire_direct_post_via_cdp(fire_offset_ms=-40, burst_count=8, burst_gap_ms=35,
                 const FIRE_OFFSET_MS = __FIRE_OFFSET__;   // arrival của phát đầu, so với server midnight
                 const BURST_N        = __BURST_N__;
                 const BURST_GAP_MS   = __BURST_GAP__;
+                const PROBE_TIMEOUT_MS = 1500;  // 1 probe treo KHÔNG được ăn mất cửa sổ bắn (sự cố 28/09)
+                const PROBE_GAP_MS     = 150;   // giãn nhịp probe → đỡ bị rate-limit, bớt lộ
 
                 // ---- creds ----
                 const html = document.documentElement.outerHTML;
@@ -212,23 +214,26 @@ def fire_direct_post_via_cdp(fire_offset_ms=-40, burst_count=8, burst_gap_ms=35,
                 async function probe(){
                     const t0 = Date.now();
                     let dh = null;
+                    const ac = new AbortController();
+                    const tid = setTimeout(function(){ try{ ac.abort(); }catch(e){} }, PROBE_TIMEOUT_MS);
                     try {
-                        const r = await fetch('/api/v2/security/signature-token', {method:'HEAD', cache:'no-store', credentials:'same-origin'});
+                        const r = await fetch('/api/v2/security/signature-token', {method:'HEAD', cache:'no-store', credentials:'same-origin', signal: ac.signal});
                         dh = r.headers.get('date');
                     } catch(e){}
+                    clearTimeout(tid);
                     const t1 = Date.now();
                     const serverMs = dh ? new Date(dh).getTime() : null; // giây, .000
                     return {serverMs, mid:(t0+t1)/2, rtt:t1-t0};
                 }
                 function median(arr){ const s=arr.slice().sort((a,b)=>a-b); const m=Math.floor(s.length/2); return s.length%2 ? s[m] : (s[m-1]+s[m])/2; }
-                let prevSec = null, prevMid = null, minRtt = 99999, samples = 0;
+                let prevSec = null, prevMid = null, minRtt = null, samples = 0;
                 const edgeOffsets = [];
                 const calDeadline = N - 3500;  // ~5.5s probing
                 while (Date.now() < calDeadline) {
                     const p = await probe();
                     samples++;
-                    if (p.serverMs === null) continue;
-                    if (p.rtt < minRtt) minRtt = p.rtt;
+                    if (p.serverMs !== null) {
+                    if (minRtt === null || p.rtt < minRtt) minRtt = p.rtt;
                     if (prevSec !== null && p.serverMs > prevSec) {
                         // giây server nhảy giữa probe trước (prevMid) và probe này (p.mid).
                         // Mốc .000 của giây mới nằm TRONG khoảng (prevMid, p.mid) → ước lượng tốt nhất = trung điểm.
@@ -238,23 +243,38 @@ def fire_direct_post_via_cdp(fire_offset_ms=-40, burst_count=8, burst_gap_ms=35,
                     }
                     prevSec = p.serverMs;
                     prevMid = p.mid;
+                    }
+                    // giãn nhịp + tôn trọng deadline cứng: không để probe ăn lấn cửa sổ bắn
+                    if (calDeadline - Date.now() > PROBE_GAP_MS) await new Promise(r=>setTimeout(r, PROBE_GAP_MS));
+                    else break;
                 }
-                let offset;
+                let offset = null;
                 if (edgeOffsets.length) {
                     offset = median(edgeOffsets);  // median chống outlier từ probe bị mạng giật
-                } else {
-                    // không bắt được edge → fallback coarse: dùng probe cuối (±1s). RỦI RO nếu clock lệch lớn.
+                } else if (Date.now() < N - 800) {
+                    // chưa bắt edge nhưng CÒN thời gian → 1 probe thô (±1s)
                     const p = await probe();
                     if (p.serverMs !== null) { offset = p.serverMs - p.mid; log('WARN: no edge, coarse offset ±1s'); }
-                    else return {ok:false, err:'calibration fail: no Date header', log:LOG};
+                }
+                if (offset === null) {
+                    // Calibration hỏng hẳn → KHÔNG bịa. Bắn theo nửa đêm danh nghĩa (clock máy đã sync HTTP).
+                    offset = 0;
+                    log('WARN: calibration FAIL -> offset=0 (ban theo nua dem danh nghia)');
                 }
                 const edges = edgeOffsets.length;
-                const oneWay = minRtt / 2;
+                // GUARD: chặn sentinel/giá trị rác rò vào timing. Bug 28/09: minRtt=99999 -> oneWay=50s
+                // -> sendBase lùi 50s -> mọi vòng chờ qua ngay -> bắn loạn nhịp lúc 00:00:29 -> top 21.
+                const rttForCalc = (minRtt !== null && minRtt >= 0 && minRtt <= 3000) ? minRtt : 300;
+                const oneWay = rttForCalc / 2;
                 const spread = edges >= 2 ? Math.round(Math.max.apply(null,edgeOffsets)-Math.min.apply(null,edgeOffsets)) : 0;
-                log('cal: offset='+Math.round(offset)+'ms minRtt='+minRtt+'ms edges='+edges+' spread='+spread+'ms samples='+samples);
+                log('cal: offset='+Math.round(offset)+'ms minRtt='+minRtt+' rttUsed='+rttForCalc+'ms edges='+edges+' spread='+spread+'ms samples='+samples);
 
                 // ---- lịch fire: send_local_k = (N - offset) - oneWay + FIRE_OFFSET_MS + k*GAP ----
-                const sendBase = (N - offset) - oneWay + FIRE_OFFSET_MS;
+                let sendBase = (N - offset) - oneWay + FIRE_OFFSET_MS;
+                // Nếu lịch đã ở quá khứ (calibration kéo dài) → kẹp về hiện tại để burst còn giãn đều,
+                // và GHI LOG rõ là đã trễ (thay vì âm thầm bắn loạn như đêm 28/09).
+                let lateMs = 0;
+                if (sendBase < Date.now()) { lateMs = Math.round(Date.now() - sendBase); log('WARN: sendBase tre '+lateMs+'ms -> ban ngay'); sendBase = Date.now(); }
                 const sends = [];
                 for (let k=0;k<BURST_N;k++) sends.push(sendBase + k*BURST_GAP_MS);
 
@@ -300,7 +320,7 @@ def fire_direct_post_via_cdp(fire_offset_ms=-40, burst_count=8, burst_gap_ms=35,
 
                 return {
                     ok: !!winner,
-                    offsetMs: Math.round(offset), minRttMs: minRtt, edges, spreadMs: spread,
+                    offsetMs: Math.round(offset), minRttMs: minRtt, rttUsedMs: rttForCalc, lateMs: lateMs, edges, spreadMs: spread,
                     fireStart: new Date(Math.round(sendBase)).toISOString(),
                     winner: winner || null,
                     results,
@@ -341,7 +361,10 @@ def fire_direct_post_via_cdp(fire_offset_ms=-40, burst_count=8, burst_gap_ms=35,
         resp_block = " || ".join(
             f"#{','.join(str(k) for k in ks)}: {raw}" for raw, ks in groups.items()
         )
-        cal = f"offset={value.get('offsetMs')}ms rtt={value.get('minRttMs')}ms edges={value.get('edges')} spread={value.get('spreadMs')}ms"
+        late = value.get("lateMs") or 0
+        cal = (f"offset={value.get('offsetMs')}ms rtt={value.get('minRttMs')}/dùng{value.get('rttUsedMs')}ms "
+               f"edges={value.get('edges')} spread={value.get('spreadMs')}ms"
+               + (f" | ⚠️TRỄ {late}ms" if late > 500 else ""))
         if value.get("ok"):
             w = value.get("winner") or {}
             return True, f"FIRE OK | {cal} | winner #{w.get('k')} pos={w.get('pos')} lat={w.get('lat')}ms | burst[{brief}]\n📋 resp: {resp_block[:600]}"

@@ -30,10 +30,11 @@ from auto_click import (
     kill_chrome,
     reload_and_click_via_cdp,
     load_config,
+    log_rank_datapoint,
 )
 
 
-def _do_checkin(creds, label):
+def _do_checkin(creds, label, mode):
     """Click điểm danh (trang tự xử Turnstile), verify, báo Telegram. Trả True nếu điểm danh OK."""
     ok, msg = reload_and_click_via_cdp(max_attempts=25, poll_interval_ms=200)
     time.sleep(4)
@@ -45,6 +46,11 @@ def _do_checkin(creds, label):
                 + (" (lần 2)" if attempt else "")
                 + f" | streak={st.get('currentStreak')} | rank={st.get('todayCheckInPosition')}"
             )
+            # Ghi rank_data.md để đêm nhường KHÔNG còn là điểm mù (trước đây keepalive không log).
+            try:
+                log_rank_datapoint(st, datetime.now().date(), mode, "", "")
+            except Exception as e:
+                print(f"[log_rank keepalive err] {e}")
             return True
         if attempt == 0:
             reload_and_click_via_cdp(max_attempts=25, poll_interval_ms=200)
@@ -100,10 +106,10 @@ def main():
             delay = random.randint(0, 600)
             print(f"[cede] đêm nhường — chờ {delay}s rồi điểm danh...")
             time.sleep(delay)
-            _do_checkin(creds, "🌙 NHƯỜNG")
+            _do_checkin(creds, "🌙 NHƯỜNG", "cede-day")
         else:
             # KHÔNG phải đêm nhường mà chưa điểm danh → midnight fire LỖI → cứu streak NGAY.
-            _do_checkin(creds, "🛟 CỨU STREAK (midnight có thể đã lỗi)")
+            _do_checkin(creds, "🛟 CỨU STREAK (midnight có thể đã lỗi)", "rescue-day")
     except Exception as e:
         send_telegram(f"⚠️ Keepalive điểm danh lỗi: {type(e).__name__}: {str(e)[:150]}")
 

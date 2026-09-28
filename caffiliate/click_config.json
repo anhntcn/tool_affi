@@ -5,7 +5,7 @@
   "stealth_enabled": true,
   "stealth_top1_prob": 1.0,
   "stealth_max_consec_top1": 3,
-  "stealth_consec_top1": 3,
+  "stealth_consec_top1": 0,
   "stealth_coast_delay_ms": 30,
   "stealth_force_mode_once": "",
   "stealth_jitter_ms": 120,
@@ -37,6 +37,6 @@
     4,
     5
   ],
-  "cede_countdown": 5,
-  "cede_date": "2026-09-21"
+  "cede_countdown": 2,
+  "cede_date": "2026-09-26"
 }
