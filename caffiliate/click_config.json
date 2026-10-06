@@ -42,5 +42,14 @@
   "stealth_burst_span_ms": 320,
   "probe_gap_ms": 250,
   "cal_end_ms": 9500,
-  "cal_window_ms": 2500
+  "cal_window_ms": 2500,
+  "soft_enabled": true,
+  "soft_gap_choices": [
+    3,
+    4,
+    5
+  ],
+  "soft_countdown": 2,
+  "soft_offset_ms": 220,
+  "soft_jitter_ms": 40
 }

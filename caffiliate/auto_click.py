@@ -863,6 +863,20 @@ def stealth_plan(cfg):
         st = cfg.get("stealth_probe_status", "probing")
         return off, int(bc), int(gap), "probe", f"probe off={off}ms step={cfg.get('stealth_probe_step_ms', 30)} status={st}"
 
+    # --- Đêm NHƯỜNG MỀM? Nhắm #2-3 (VẪN CÓ thưởng vì top2=top3) thay vì #1 → hạ win-rate mà KHÔNG
+    #     mất trắng như nhường-ban-ngày (đêm đó rank thấp = 0 thưởng).
+    #     Khả thi vì sân đã đông lại: 01/10 arrival 185ms→#2, 05/10 arrival 240ms→#2.
+    #     TẮT = `soft_enabled: false` → quay lại y hệt hành vi cũ, không cần git. ---
+    if cfg.get("soft_enabled", False) and cfg.get("soft_countdown", 4) <= 1:
+        base_soft = cfg.get("soft_offset_ms", 220)
+        sj = cfg.get("soft_jitter_ms", 40)
+        off = int(base_soft + random.randint(-sj, sj))
+        off = max(0, min(off, 600))   # CAP: không lao sâu vào đám đông (offset +520 từng ra #7)
+        bc = cfg.get("stealth_burst_top1", 3)
+        span = cfg.get("stealth_burst_span_ms", 320)
+        gap = max(25, int(span / max(1, bc - 1)) + random.randint(-15, 15))
+        return off, int(bc), int(gap), "soft", f"soft off={off}ms (nhắm #2-3) base={base_soft}ms"
+
     # --- Đêm thường: #1 an toàn + jitter cho timing đa dạng ---
     # QUAN TRỌNG: đủ phát để LUÔN có phát rơi SAU giờ server mở, dù offset âm. Nếu không, cả burst
     # rơi trước giờ mở → fire fail → fallback (commit muộn ~8s) → rớt hạng (bug đêm 27/08: off=-146 → #11).
@@ -907,6 +921,20 @@ def stealth_update(cfg, rank, mode, offset_used):
             if step <= 10:
                 # bước đã nhỏ mà vẫn 1→≥4 (bỏ qua #2-3) → VÁCH ĐÁ, không có băng #2-3 → ngừng nhường
                 cfg["stealth_probe_status"] = "cliff"
+
+    # --- Lịch + tự chỉnh NHƯỜNG MỀM (AIMD quanh đích #2-3, bảo vệ vách đá top-3) ---
+    if cfg.get("soft_enabled", False):
+        if mode == "soft":
+            b = cfg.get("soft_offset_ms", 220)
+            if rank == 1:
+                b = min(600, b + 40)    # vẫn #1 → nhường chưa đủ, lùi thêm chút
+            elif rank >= 4:
+                b = max(0, b - 80)      # rớt khỏi top3 (0 thưởng) → tiến lên lại, lùi nhanh
+            # rank 2-3 = đúng đích → giữ nguyên
+            cfg["soft_offset_ms"] = int(b)
+            cfg["soft_countdown"] = random.choice(cfg.get("soft_gap_choices", [3, 4, 5]))
+        else:
+            cfg["soft_countdown"] = max(1, cfg.get("soft_countdown", 4) - 1)
         # đặt lịch đêm nhường KẾ TIẾP ngẫu nhiên (gap 3/4/5), không cố định
         cfg["stealth_probe_countdown"] = random.choice(cfg.get("stealth_probe_gap_choices", [2, 3, 4]))
     else:
@@ -1043,7 +1071,7 @@ def cmd_run():
     #    → không lệ thuộc clock máy; chịu được jitter; log offset/RTT/pos để tinh chỉnh.
     # fire_offset_ms ở đây = arrival của phát ĐẦU so với midnight server (âm = trước, để phát sau bắt boundary).
     fire_offset_ms, burst_count, burst_gap_ms, stealth_mode, stealth_note = stealth_plan(cfg)
-    mode_icon = "🎯" if stealth_mode == "aggressive" else ("🕶️" if stealth_mode == "coast" else "🚀")
+    mode_icon = {"aggressive": "🎯", "soft": "🌗", "probe": "🔎", "coast": "🕶️"}.get(stealth_mode, "🚀")
     send_telegram(f"{mode_icon} Fire [{stealth_note}]. arrival phát đầu = midnight{fire_offset_ms:+d}ms server.")
     ok, msg = fire_direct_post_via_cdp(fire_offset_ms=fire_offset_ms, burst_count=burst_count, burst_gap_ms=burst_gap_ms, pre_tokens=pre_tokens,
                                       probe_gap_ms=cfg.get('probe_gap_ms', 250),
