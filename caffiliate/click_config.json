@@ -5,11 +5,11 @@
   "stealth_enabled": true,
   "stealth_top1_prob": 1.0,
   "stealth_max_consec_top1": 3,
-  "stealth_consec_top1": 0,
+  "stealth_consec_top1": 1,
   "stealth_coast_delay_ms": 30,
   "stealth_force_mode_once": "",
   "stealth_jitter_ms": 120,
-  "stealth_burst_top1": 7,
+  "stealth_burst_top1": 3,
   "stealth_burst_coast": 3,
   "button_x": 1230,
   "button_y": 348,
@@ -37,6 +37,10 @@
     4,
     5
   ],
-  "cede_countdown": 2,
-  "cede_date": "2026-09-26"
+  "cede_countdown": 3,
+  "cede_date": "2026-10-04",
+  "stealth_burst_span_ms": 320,
+  "probe_gap_ms": 250,
+  "cal_end_ms": 9500,
+  "cal_window_ms": 2500
 }
